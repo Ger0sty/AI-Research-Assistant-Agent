@@ -13,7 +13,7 @@ from . import ops
 def resolve_author(author_spec: specs.AuthorSpec) -> ops.DocOp:
     match author_spec:
         case specs.AuthorSpec(name=str(name), papers=None):
-            return ops.FromS2ByAuthorByName(author=name)
+            return ops.FromByAuthorByName(author=name)
         case specs.AuthorSpec(affiliation=affiliation) if affiliation:
             raise NotImplementedError("Author affiliation is not supported yet")
         case specs.AuthorSpec(
@@ -39,9 +39,6 @@ class Rule(ABC):
 
     @abstractmethod
     def consumes(self) -> list[str]:
-        """
-        Abstract method to define the consumed attributes.
-        """
         pass
 
     def __init_subclass__(cls, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
@@ -50,12 +47,6 @@ class Rule(ABC):
             Rule.rules.append(cls())
 
     def resolve(self, paper_spec: specs.PaperSpec, prev: Optional[ops.DocOp]) -> Optional[ops.DocOp]:
-        """
-        Resolve a part of the paper specification into a plan.
-        :param paper_spec: The paper specification to resolve.
-        :param prev: The previous plan, if any.
-        :return: The resolved plan.
-        """
         match (self, prev):
             case (Source() as source, prev):
                 plan = source.apply(paper_spec)
@@ -74,34 +65,18 @@ class Rule(ABC):
 class Source(Rule, ABC):
     @abstractmethod
     def apply(self, paper_spec: specs.PaperSpec) -> Optional[ops.DocOp]:
-        """
-        Compute a plan from the paper specification.
-        :param paper_spec: The paper specification to resolve.
-        :return: The resolved plan.
-        """
         pass
 
 
 class Primary(Rule, ABC):
     @abstractmethod
     def generate(self, paper_spec: specs.PaperSpec) -> Optional[ops.DocOp]:
-        """
-        Generate a plan from the paper specification.
-        :param paper_spec: The paper specification to resolve.
-        :return: The resolved plan.
-        """
         pass
 
 
 class Filter(Rule, ABC):
     @abstractmethod
     def filter(self, paper_spec: specs.PaperSpec, prev: Optional[ops.DocOp]) -> Optional[ops.DocOp]:
-        """
-        Filter a plan from the paper specification.
-        :param paper_spec: The paper specification to resolve.
-        :param prev: The previous plan, if any.
-        :return: The resolved plan.
-        """
         pass
 
 
@@ -141,9 +116,9 @@ class GenByNameVenueYears(Source):
                         raise ValueError("Invalid venue specification")
                 match years:
                     case ExtractedYearlyTimeRange() | None:
-                        return ops.FromS2ByTitle(name=title, time_range=years, venues=venues)
+                        return ops.FromByTitle(name=title, time_range=years, venues=venues)
                     case specs.Set(op="or", items=items):
-                        deps = list(map(lambda x: ops.FromS2ByTitle(name=title, time_range=x, venues=venues), items))
+                        deps = list(map(lambda x: ops.FromByTitle(name=title, time_range=x, venues=venues), items))
                         return ops.Union(items=deps)
                     case specs.Set(op="and"):
                         raise ValueError("AND operation is not supported for years")
@@ -172,9 +147,9 @@ class GenByVenueYears(Source):
                         raise ValueError("Invalid venue specification")
                 match years:
                     case ExtractedYearlyTimeRange() | None:
-                        return ops.FromS2Search(venues=venues, time_range=years)
+                        return ops.FromSearch(venues=venues, time_range=years)
                     case specs.Set(op="or", items=items):
-                        deps = list(map(lambda x: ops.FromS2Search(venues=venues, time_range=x), items))
+                        deps = list(map(lambda x: ops.FromSearch(venues=venues, time_range=x), items))
                         return ops.Union(items=deps)
                     case specs.Set(op="and"):
                         raise ValueError("AND operation is not supported for years")
@@ -340,7 +315,7 @@ class PrimeByCitingMultiplePapers(Primary):
 
 
 @final
-class PrimeByS2Search(Primary):
+class PrimeBySearch(Primary):
     def consumes(self) -> list[str]:
         return ["years", "venue", "field_of_study", "min_citations"]
 
@@ -368,15 +343,15 @@ class PrimeByS2Search(Primary):
                     case int() as min_citations:
                         if min_citations < 0:
                             raise ValueError("Minimum citations must be a non-negative integer")
-                        f = lambda y: ops.FromS2Search(
+                        f = lambda y: ops.FromSearch(
                             venues=venues, time_range=y, fields_of_study=fields_of_study, min_citations=min_citations
                         )
                     case "high":
                         f = lambda y: ops.FilterByHighlyCited(
-                            source=ops.FromS2Search(venues=venues, time_range=y, fields_of_study=fields_of_study)
+                            source=ops.FromSearch(venues=venues, time_range=y, fields_of_study=fields_of_study)
                         )
                     case None:
-                        f = lambda y: ops.FromS2Search(venues=venues, time_range=y, fields_of_study=fields_of_study)
+                        f = lambda y: ops.FromSearch(venues=venues, time_range=y, fields_of_study=fields_of_study)
                 assert f
                 match years:
                     case ExtractedYearlyTimeRange():
@@ -387,7 +362,7 @@ class PrimeByS2Search(Primary):
                     case specs.Set(op="and"):
                         raise ValueError("AND operation is not supported for years")
                     case None:
-                        return ops.FromS2Search(venues=venues)
+                        return ops.FromSearch(venues=venues)
                     case _:
                         return None
             case _:
@@ -531,9 +506,7 @@ def resolve_paper(paper_spec: specs.PaperSpec, prev: Optional[ops.DocOp] = None)
         plan = rule.resolve(paper_spec, prev)
         if plan:
             remain = paper_spec.delete(*rule.consumes())
-            # if rule is primary and was applied, prev is None, and step is act
             return resolve_paper(remain, plan)
-    # If no rules matched, raise an error
     raise NotImplementedError("No rules matched for paper specification")
 
 

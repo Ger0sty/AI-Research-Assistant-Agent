@@ -7,29 +7,27 @@ from pydantic import BaseModel
 # Broad Search #
 # ------------ #
 
-
 _broad_search_prompt_tmpl = """
-Given a user-provided natural language description of desired scientific papers, \
-reformulate the query as an alternative search query for the Semantic Scholar search engine.
-Focus on formulating the natural language query into a keyword search query, that is, \
-remove unnecessary descriptive words that wont show up in the content itself and keep the keywords to look for.
+Given a user-provided natural language description of desired scientific papers,
+reformulate it into a concise keyword-style search query suitable for our internal paper
+search (SQL/FTS). Focus on terms likely to appear in the title, abstract, or body text.
+Avoid metadata terms (e.g., venue names, generic phrases like “recent work”) unless the
+user explicitly asks for them.
 
-Use plain text for queries, as Semantic Scholar does not support special syntax.
-Semantic Scholar does not support hyphens in queries, so avoid hyphens.
-
-When building the queries, try to use only content-keywords, that is, do emit metadata or non keyword-y wordings!
+Guidelines:
+- Prefer content-bearing keywords and short key phrases.
+- You may include quoted phrases if they are important (e.g., "contrastive learning").
+- Avoid special boolean operators or engine-specific syntax (AND/OR/NOT, field prefixes).
+- Keep it plain text and concise; no explanations.
 
 Input description: ```{paper_description}```
 """
 
-
 class FormulateBroadSearchQueryInput(TypedDict):
     paper_description: str
 
-
 class BroadSearchSuggestedQueries(BaseModel):
     keyword_query: str
-
 
 broad_search = (
     define_prompt_llm_call(

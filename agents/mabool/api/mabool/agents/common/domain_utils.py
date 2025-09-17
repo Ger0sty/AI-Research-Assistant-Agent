@@ -27,8 +27,20 @@ def get_dense_datasets_by_domains(domains: DomainsIdentified) -> list[DenseDatas
     return [DenseDataset("vespa", "open-nora", "pa1-v1")]
 
 
-def get_fields_of_study_filter_from_domains(domains: DomainsIdentified) -> list[str]:
-    # NOTE - for now we assume most of our usage would be from CS domain and thus always add it to the FoS filter
+from ai2i.config import config_value
+from mabool.data_model.config import cfg_schema
+from ai2i.common.utils.data_struct import SortedSet
+from ai2i.dcollection import DenseDataset
+from mabool.data_model.agent import DomainsIdentified
+
+def get_fields_of_study_filter_from_domains(domains: DomainsIdentified) -> list[str] | None:
+    # If we're using SQL, there’s no FoS filter—tell callers not to apply one.
+    try:
+        if config_value(cfg_schema.retriever.type) == "sql":
+            return None
+    except Exception:
+        pass  # default to old behavior if config not wired yet
+
     full_list = list(SortedSet(["Computer Science"] + [domains.main_field] + domains.key_secondary_fields))
-    # remove "Unknown" and empty strings which S2 API doesn't know
+    # S2-only cleanup; harmless elsewhere
     return [f for f in full_list if f and f != "Unknown"]

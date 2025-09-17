@@ -59,6 +59,49 @@ class BroadSearchByKeywordState(AgentState):
 BroadSearchByKeywordOutput = AgentOutput
 
 
+# ------------------------------- #
+# New: unified retrieval helper   #
+# ------------------------------- #
+def _dc_search(
+    *,
+    query: str,
+    limit: int,
+    search_iteration: int,
+    time_range: ExtractedYearlyTimeRange | None,
+    venues: list[str] | None,
+    fields_of_study: list[str] | None,
+    fields: list[str] | None = None,
+):
+    """
+    Dispatches to the configured retriever. Expects a DC-returning coroutine
+    with the same signature as DC.from_s2_search.
+
+    You must implement DC.from_sql_search(...) with the same parameters.
+    """
+    retriever_type = config_value(getattr(cfg_schema, "retriever").type)  # expects cfg.retriever.type = "sql" | "s2"
+    if retriever_type == "sql":
+        # Implement this method to query your SQL DB. It should mirror from_s2_search.
+        return DC.from_sql_search(
+            query=query,
+            limit=limit,
+            search_iteration=search_iteration,
+            time_range=time_range,
+            venues=venues,
+            fields_of_study=fields_of_study,
+            fields=fields,  # your SQL retriever can ignore unknown fields like "citation_count"
+        )
+    # default to S2 for backward compatibility
+    return DC.from_s2_search(
+        query=query,
+        limit=limit,
+        search_iteration=search_iteration,
+        time_range=time_range,
+        venues=venues,
+        fields_of_study=fields_of_study,
+        fields=fields,
+    )
+
+
 class BroadSearchByKeywordAgent(
     Operative[BroadSearchByKeywordInput, BroadSearchByKeywordOutput, BroadSearchByKeywordState]
 ):
@@ -143,13 +186,13 @@ class BroadSearchByKeywordAgent(
         if recent_first or recent_last or central_first or central_last:
             # Take `results_limit` times some factor, as later we will take top `results_limit`
             # results after sorting by citation count and/or year
-
             limit = config_value(cfg_schema.broad_search_by_keyword_agent.results_limit) * config_value(
                 cfg_schema.broad_search_by_keyword_agent.extra_results_factor
             )
 
-            # Perform search using the retrieval engine
-            search_results = await DC.from_s2_search(
+            # Perform search using the configured retrieval engine
+            # NOTE: includes "citation_count" — SQL retriever may ignore if unavailable.
+            search_results = await _dc_search(
                 query=query,
                 limit=limit,
                 search_iteration=search_iteration,
@@ -174,13 +217,14 @@ class BroadSearchByKeywordAgent(
 
             search_results = await DC.from_docs(search_results.documents).with_fields(BASIC_FIELDS)
         else:
-            search_results = await DC.from_s2_search(
+            search_results = await _dc_search(
                 query=query,
                 limit=config_value(cfg_schema.broad_search_by_keyword_agent.results_limit),
                 search_iteration=search_iteration,
                 time_range=time_range,
                 venues=venues,
                 fields_of_study=get_fields_of_study_filter_from_domains(domains),
+                # fields omitted: BASIC_FIELDS will typically be returned by default
             )
 
         if apply_relevance_judgement:

@@ -61,50 +61,80 @@ def filter_by_time_range_with_buffer(
 
 
 def filter_by_venues(doc: Document, venues: list[str], keep_missing: bool = False) -> bool:
-    if not (doc.publication_venue or doc.venue):
+    # Accept both S2-style structured venue and simple strings.
+    found_names_lowered_set = set()
+
+    # S2-style: doc.venue may be a string already; keep it.
+    if getattr(doc, "venue", None):
+        v = doc.venue
+        found_names_lowered_set.add(v.lower() if isinstance(v, str) else str(v).lower())
+
+    # S2-style structured publication_venue
+    pv = getattr(doc, "publication_venue", None)
+    if pv:
+        # pv could be a dict-like or object; be defensive
+        norm = getattr(pv, "normalized_name", None) or (pv.get("normalized_name") if isinstance(pv, dict) else None)
+        if norm:
+            found_names_lowered_set.add(str(norm).lower())
+        alts = getattr(pv, "alternate_names", None) or (pv.get("alternate_names") if isinstance(pv, dict) else None)
+        if alts:
+            found_names_lowered_set.update([str(a).lower() for a in alts])
+
+    # SQL path: if neither venue nor publication_venue present
+    if not found_names_lowered_set:
         if keep_missing:
-            logger.warning("filter_by_venues: Keeping the doc even though both venue and publication_venue are not set")
+            logger.warning("filter_by_venues: Keeping doc; no venue/publication_venue present")
             return True
         return False
 
-    found_names_lowered_set = set()
-    if doc.venue:
-        found_names_lowered_set.add(doc.venue.lower())
-    if doc.publication_venue:
-        found_names_lowered_set.add(doc.publication_venue.normalized_name)
-        if doc.publication_venue.alternate_names:
-            found_names_lowered_set.update([v.lower() for v in doc.publication_venue.alternate_names])
-    requested_venues_lowered_set = set(v.lower() for v in venues)
+    requested_venues_lowered_set = {v.lower() for v in venues}
+    return bool(found_names_lowered_set.intersection(requested_venues_lowered_set))
 
-    # if one of the requested venues appears as one of the alternative names then it's a match
-    if found_names_lowered_set.intersection(requested_venues_lowered_set):
-        return True
-    return False
 
 
 def filter_by_author(expected_authors: list[str], doc: Document, keep_missing: bool | None = False) -> bool:
     if not expected_authors:
         return True
 
-    if not doc.authors:
+    found_authors = getattr(doc, "authors", None)
+
+    # SQL path: authors might be a single string like "Alice Smith; Bob Lee"
+    if isinstance(found_authors, str):
+        found_authors_list = [a.strip() for a in found_authors.split(";") if a.strip()]
+    elif isinstance(found_authors, (list, tuple)):
+        # Might be list[str] or list[objects with .name]
+        tmp = []
+        for a in found_authors:
+            if isinstance(a, str):
+                tmp.append(a.strip())
+            else:
+                name = getattr(a, "name", None) or (a.get("name") if isinstance(a, dict) else None)
+                if name:
+                    tmp.append(str(name).strip())
+        found_authors_list = tmp
+    else:
+        found_authors_list = []
+
+    if not found_authors_list:
         if keep_missing:
-            # lets not throw away the doc if it doesnt have its authors set
             logger.warning("filter_by_author: Keeping the doc even though authors are not set")
             return True
         return False
 
+    # Matching: last name must match; if initials available, match them too.
+    def initials(parts: list[str]) -> tuple[str, str] | tuple[()]:
+        return (parts[0][0], parts[-1][0]) if len(parts) > 1 and parts[0] and parts[-1] else ()
+
     for expected_author in expected_authors:
-        expected_name_parts = expected_author.lower().split()
-        expected_initials = (
-            (expected_name_parts[0][0], expected_name_parts[-1][0]) if len(expected_name_parts) > 1 else ()
-        )
+        exp_parts = expected_author.lower().split()
+        exp_last = exp_parts[-1] if exp_parts else ""
+        exp_inits = initials(exp_parts)
         matched = False
-        for found_author in doc.authors:
-            found_name_parts = found_author.name.lower().split()
-            found_initials = (found_name_parts[0][0], found_name_parts[-1][0]) if len(found_name_parts) > 1 else ()
-            if expected_name_parts[-1] == found_name_parts[-1] and (
-                not expected_initials or not found_initials or expected_initials == found_initials
-            ):
+        for fa in found_authors_list:
+            f_parts = fa.lower().split()
+            f_last = f_parts[-1] if f_parts else ""
+            f_inits = initials(f_parts)
+            if exp_last == f_last and (not exp_inits or not f_inits or exp_inits == f_inits):
                 matched = True
                 break
         if not matched:
@@ -124,7 +154,8 @@ async def filter_docs_by_metadata(
     if time_range and time_range.non_empty():
         fields_to_load.append("year")
     if venues:
-        fields_to_load.extend(["venue", "publication_venue"])
+        # These may not exist in SQL; with_fields should tolerate missing, but keep it minimal.
+        fields_to_load.extend([f for f in ["venue", "publication_venue"] if hasattr(docs.factory.document_type, f)])
     if authors:
         fields_to_load.append("authors")
 
@@ -140,16 +171,13 @@ async def filter_docs_by_metadata(
 
     if venues:
         logger.info(f"Filtering documents by venue list: {', '.join(venues)}")
-        filter_by_venues_partial = partial(filter_by_venues, venues=venues, keep_missing=keep_missing)
-        docs = docs.filter(filter_by_venues_partial)
+        docs = docs.filter(partial(filter_by_venues, venues=venues, keep_missing=keep_missing))
 
     if authors:
         logger.info(f"Filtering documents by author list: {', '.join(authors)}")
-        filter_by_author_partial = partial(filter_by_author, expected_authors=authors, keep_missing=keep_missing)
-        docs = docs.filter(filter_by_author_partial)
+        docs = docs.filter(partial(filter_by_author, expected_authors=authors, keep_missing=keep_missing))
 
     logger.info(f"Number of documents after filter: {len(docs)}")
-
     return docs
 
 

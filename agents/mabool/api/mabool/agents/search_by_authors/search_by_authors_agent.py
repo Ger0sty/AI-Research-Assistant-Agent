@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime
-from typing import Any, Coroutine
+from typing import Any, Coroutine, Sequence
 
 from ai2i.chain import LLMEndpoint, LLMModel, Timeouts, define_llm_endpoint
 from ai2i.config import config_value
@@ -9,28 +9,18 @@ from ai2i.dcollection import (
     DocumentCollectionFactory,
     DocumentCollectionSortDef,
     ExtractedYearlyTimeRange,
-    s2_get_authors_by_name,
 )
 from ai2i.di import DI
-from semanticscholar.Author import Author
+from pydantic import BaseModel
 
-from mabool.agents.broad_search_by_keyword.broad_search_by_keyword_agent import (
-    suggest_retrieval_query,
-)
-from mabool.agents.common.common import (
-    AgentState,
-    filter_by_author,
-    filter_docs_by_metadata,
-)
+from mabool.agents.broad_search_by_keyword.broad_search_by_keyword_agent import suggest_retrieval_query
+from mabool.agents.common.common import AgentState, filter_by_author, filter_docs_by_metadata
 from mabool.agents.common.computed_fields.fields import rerank_score_field
 from mabool.agents.common.computed_fields.relevance import relevance_judgement_field
-from mabool.agents.common.domain_utils import get_fields_of_study_filter_from_domains
 from mabool.agents.common.relevance_judgement_utils import get_relevant_docs
 from mabool.agents.common.utils import alog_args
 from mabool.agents.llm_suggestion.llm_suggestion_agent import get_llm_suggested_papers
-from mabool.agents.search_by_authors.search_by_authors_prompts import (
-    disambiguate_user_response,
-)
+from mabool.agents.search_by_authors.search_by_authors_prompts import disambiguate_user_response
 from mabool.data_model.agent import (
     AgentError,
     AgentInput,
@@ -40,13 +30,7 @@ from mabool.data_model.agent import (
     RelevanceCriteria,
 )
 from mabool.data_model.config import cfg_schema
-from mabool.infra.operatives import (
-    CompleteResponse,
-    InquiryQuestion,
-    Operative,
-    OperativeResponse,
-    VoidResponse,
-)
+from mabool.infra.operatives import CompleteResponse, InquiryQuestion, Operative, OperativeResponse, VoidResponse
 from mabool.utils import dc_deps
 from mabool.utils.asyncio import custom_gather
 from mabool.utils.dc import DC
@@ -54,6 +38,25 @@ from mabool.utils.llm_utils import get_api_key_for_model
 
 logger = logging.getLogger(__name__)
 
+# ---------- Adapters you must implement against your SQL DB ----------
+
+class AuthorProfile(BaseModel):
+    author_id: str
+    name: str
+    paper_count: int = 0  # computed as COUNT(*) over your papers table
+
+async def sql_find_authors_by_name(name: str, factory: DocumentCollectionFactory) -> list[AuthorProfile]:
+    """
+    Implement: fuzzy/exact search over your author index/table.
+    SHOULD populate paper_count (e.g., count of papers for ranking).
+    """
+    raise NotImplementedError
+
+# If you already have helpers, replace these two calls accordingly:
+# - await factory.from_sql_authors([[AuthorProfile(...), ...]], limit=...)
+# - await factory.from_sql_query(query=..., author_names=[...], start_year=..., end_year=..., limit=...)
+
+# ---------------------------------------------------------------------
 
 class SearchByAuthorsInput(AgentInput):
     authors: list[str]
@@ -61,13 +64,13 @@ class SearchByAuthorsInput(AgentInput):
     user_content_input: str | None = None
     relevance_criteria: RelevanceCriteria | None = None
     time_range: ExtractedYearlyTimeRange | None = None
+    # Kept for API compatibility, but ignored by SQL path unless you add venues to your schema.
     venues: list[str] | None = None
+    # Kept for API compatibility; unused in SQL path unless you map it yourself.
     domains: DomainsIdentified
 
 
 class NoAuthorMatchedError(Exception):
-    message: str
-
     def __init__(self, msg: str) -> None:
         super().__init__(msg)
         self.message = msg
@@ -78,7 +81,7 @@ SearchByAuthorsOutput = AgentOutput
 
 AUTHOR_PAGINATION = 5
 prefix = "Please specify which of the following you are interested in (out of {amount}):\n\n"
-author_candidate = '{idx}. <Author authorId="{id}">{name}</Author> - {count} papers, {h_index} h-index.'  # noqa: E501
+author_candidate = '{idx}. {name} — {count} papers'  # simplified; no h-index available in SQL by default
 suffix = "\n\nPlease type the index of the author (can be an index also from previous responds)"
 next_suffix = ', or "next" otherwise.'
 no_next_suffix = " as this is the last batch of authors."
@@ -97,42 +100,33 @@ def get_default_endpoint() -> LLMEndpoint:
 def get_time_range_hint(time_range: ExtractedYearlyTimeRange | None) -> str:
     if not time_range:
         return ""
-
     if time_range.start:
         if time_range.start == time_range.end:
             return f"During {time_range.start}."
-        else:
-            return (
-                f"Sometime between {time_range.start}"
-                + f" and {time_range.end if time_range.end else datetime.now().year}."
-            )
-    else:
-        if time_range.end:
-            return f"Sometime no later than {time_range.end}."
-
+        return f"Sometime between {time_range.start} and {time_range.end or datetime.now().year}."
+    if time_range.end:
+        return f"Sometime no later than {time_range.end}."
     return ""
 
 
 def get_venues_hint(venues: list[str] | None) -> str:
-    if venues:
-        return f"Published in {' or '.join(venues)}."
-
+    # Your SQL schema does not include venues; leave blank or wire up once available.
     return ""
 
 
 class SearchByAuthorsAgent(Operative[SearchByAuthorsInput, SearchByAuthorsOutput, SearchByAuthorsState]):
-    def register(self) -> None: ...
+    def register(self) -> None:
+        ...
 
-    async def disambiguate_author(self, author_name: str, found_authors: list[Author]) -> list[Author]:
+    async def disambiguate_author(self, author_name: str, found_authors: list[AuthorProfile]) -> list[AuthorProfile]:
+        # Rank by: exact case-insensitive match > all tokens contained > paper_count
+        tokens = author_name.lower().split()
         sorted_authors = sorted(
             found_authors,
             key=lambda a: (
-                # if more than just last/first name, check for exact match (case insensitive)
-                len(author_name.strip().split()) > 1 and a.name.lower() == author_name.lower(),
-                # check if all parts of the name are in the author name (to deprioritize initials)
-                all(name_part.lower() in a.name.lower().split() for name_part in author_name.split()),
-                int(a.hIndex),
-                int(a.paperCount),
+                a.name.lower() == author_name.lower(),
+                all(t in a.name.lower().split() for t in tokens),
+                int(a.paper_count),
             ),
             reverse=True,
         )
@@ -149,14 +143,7 @@ class SearchByAuthorsAgent(Operative[SearchByAuthorsInput, SearchByAuthorsOutput
             cur_authors = sorted_authors[i : i + AUTHOR_PAGINATION]
             options = [str(i + j + 1) for j in range(len(cur_authors))] + (["next"] if not_last_batch else [])
             formatted_candidates = [
-                author_candidate.format(
-                    idx=i + j + 1,
-                    name=a.name,
-                    count=a.paperCount,
-                    id=a.authorId,
-                    h_index=a.hIndex,
-                )
-                for j, a in enumerate(cur_authors)
+                author_candidate.format(idx=i + j + 1, name=a.name, count=a.paper_count) for j, a in enumerate(cur_authors)
             ]
             formulated_question = (
                 prefix.format(amount=len(sorted_authors))
@@ -169,7 +156,6 @@ class SearchByAuthorsAgent(Operative[SearchByAuthorsInput, SearchByAuthorsOutput
             try:
                 if inquire_response.answer == "next":
                     continue
-                # best effort, if its already int-able convert it, otherwise try to disambiguate
                 disambiguated_user_response = int(inquire_response.answer)
                 return [sorted_authors[disambiguated_user_response - 1]]
             except ValueError:
@@ -190,64 +176,56 @@ class SearchByAuthorsAgent(Operative[SearchByAuthorsInput, SearchByAuthorsOutput
         raise NoAuthorMatchedError("There are no more authors matching this name")
 
     @DI.managed
-    async def get_authors_papers_by_s2_authors(
+    async def get_authors_papers_by_sql_authors(
         self,
         authors: list[str],
         doc_collection_factory: DocumentCollectionFactory = DI.requires(dc_deps.round_doc_collection_factory),
     ) -> DocumentCollection:
-        # get top authors by paperCount per requested author
-        top_authors = []
+        # Find top profiles per requested author
+        top_authors: list[list[AuthorProfile]] = []
         for author in authors:
-            found_authors = await s2_get_authors_by_name(author, doc_collection_factory.context())
-            if not found_authors:
+            found = await sql_find_authors_by_name(author, doc_collection_factory)
+            if not found:
                 raise NoAuthorMatchedError(f"No author was found by this name: {author}")
-            top_authors.append(await self.disambiguate_author(author, found_authors))
+            top_authors.append(await self.disambiguate_author(author, found))
 
-        flat_authors = [a for author_profile in top_authors for a in author_profile]
+        flat = [a for group in top_authors for a in group]
 
-        search_results = await DC.from_s2_by_author(
-            [flat_authors],
-            config_value(cfg_schema.s2_api.total_papers_limit),
+        # Replace with your actual factory/adapter call:
+        # Expectation: returns union of papers for the provided author IDs.
+        results = await doc_collection_factory.from_sql_authors(
+            author_ids=[a.author_id for a in flat],
+            limit=config_value(cfg_schema.s2_api.total_papers_limit),  # reuse limit knob
         )
+
         if len(authors) > 1:
-            # here we keep only the papers that are actually with all the authors,
-            #   but since we have k profiles per author we check at least one of each author's profile group appears
-            # NOTE - this could be done with co_author api but it currently it not efficient
-            search_results = search_results.filter(
+            # Keep only papers that include at least one profile per requested author group
+            results = results.filter(
                 lambda doc: all(
-                    [
-                        len(
-                            {a.author_id for a in (doc.authors if doc.authors else [])}.intersection(
-                                {a.authorId for a in author_profiles}
-                            )
-                        )
-                        for author_profiles in top_authors
-                    ]
+                    len({au.author_id for au in (doc.authors or [])}.intersection({p.author_id for p in group})) > 0
+                    for group in top_authors
                 )
             )
 
-        return search_results
+        return results
 
-    async def get_authors_papers_by_s2_relevance(
+    async def get_authors_papers_by_sql_relevance(
         self,
         authors: list[str],
         user_content_input: str,
-        domains: DomainsIdentified,
+        domains: DomainsIdentified,  # kept for signature compatibility
         time_range: ExtractedYearlyTimeRange | None = None,
-        venues: list[str] | None = None,
+        venues: list[str] | None = None,  # ignored; schema has no venues
     ) -> DocumentCollection:
         reformulated_query = await suggest_retrieval_query(user_content_input)
-        results = await DC.from_s2_search(
-            query=" ".join([reformulated_query] + authors),
+        # Replace with your SQL-backed text search over Title/Abstract/Text
+        return await DC.from_sql_query(  # <-- swap to your helper
+            query=reformulated_query,
+            author_names=authors,
+            start_year=time_range.start if time_range else None,
+            end_year=time_range.end if time_range else None,
             limit=config_value(cfg_schema.search_by_author_agent.relevance_judgements_quota),
-            time_range=time_range,
-            venues=venues,
-            fields_of_study=get_fields_of_study_filter_from_domains(domains),
         )
-
-        # filter results by author matches
-        results = results.filter(lambda doc: filter_by_author(authors, doc, keep_missing=False))
-        return results
 
     def get_authors_papers_fast_and_naive_methods(
         self,
@@ -257,12 +235,10 @@ class SearchByAuthorsAgent(Operative[SearchByAuthorsInput, SearchByAuthorsOutput
         time_range: ExtractedYearlyTimeRange | None = None,
         venues: list[str] | None = None,
     ) -> list[Coroutine[Any, Any, DocumentCollection]]:
-        futures = []
-
-        futures.append(
-            self.get_authors_papers_by_s2_relevance(authors, user_content_input, domains, time_range, venues)
-        )
-
+        futures: list[Coroutine[Any, Any, DocumentCollection]] = []
+        # 1) SQL full-text relevance restricted to author(s)
+        futures.append(self.get_authors_papers_by_sql_relevance(authors, user_content_input, domains, time_range, venues))
+        # 2) LLM suggestions + title search (still useful)
         extra_hints = [
             f"The paper was written by {' and '.join(authors)}.",
             get_time_range_hint(time_range),
@@ -275,7 +251,6 @@ class SearchByAuthorsAgent(Operative[SearchByAuthorsInput, SearchByAuthorsOutput
                 extra_hints=" ".join(filter(None, extra_hints)),
             )
         )
-
         return futures
 
     @DI.managed
@@ -285,29 +260,14 @@ class SearchByAuthorsAgent(Operative[SearchByAuthorsInput, SearchByAuthorsOutput
         user_content_input: str | None,
         relevance_criteria: RelevanceCriteria | None,
         time_range: ExtractedYearlyTimeRange | None = None,
-        venues: list[str] | None = None,
+        venues: list[str] | None = None,  # ignored unless you add venues to SQL
     ) -> DocumentCollection:
-        if (
-            (time_range is not None and time_range.non_empty())
-            or (venues is not None and len(venues) > 1)
-            or (
-                user_content_input
-                and relevance_criteria is not None
-                and relevance_criteria.required_relevance_critieria
-            )
+        if (time_range and time_range.non_empty()) or (
+            user_content_input and relevance_criteria and relevance_criteria.required_relevance_critieria
         ):
-            results = await filter_docs_by_metadata(
-                results,
-                time_range,
-                venues,
-                keep_missing=False,
-            )
+            results = await filter_docs_by_metadata(results, time_range, None, keep_missing=False)
 
-            if (
-                user_content_input
-                and relevance_criteria is not None
-                and relevance_criteria.required_relevance_critieria
-            ):
+            if user_content_input and relevance_criteria and relevance_criteria.required_relevance_critieria:
                 quota = config_value(cfg_schema.search_by_author_agent.relevance_judgements_quota)
                 if len(results.documents) > quota:
                     results = await results.with_fields([rerank_score_field(relevance_criteria)])
@@ -325,47 +285,39 @@ class SearchByAuthorsAgent(Operative[SearchByAuthorsInput, SearchByAuthorsOutput
         inputs: SearchByAuthorsInput,
     ) -> tuple[SearchByAuthorsState | None, OperativeResponse[SearchByAuthorsOutput]]:
         try:
-            futures = []
+            futures: list[Coroutine[Any, Any, DocumentCollection]] = []
 
-            # if we have content lets try some more "naive" and fast methods:
-            #   1. with s2 relevance
-            #   2. with llm suggest
             if inputs.user_content_input:
                 futures.extend(
                     self.get_authors_papers_fast_and_naive_methods(
-                        inputs.authors,
-                        inputs.user_content_input,
-                        inputs.domains,
-                        inputs.time_range,
-                        inputs.venues,
+                        inputs.authors, inputs.user_content_input, inputs.domains, inputs.time_range, inputs.venues
                     )
                 )
 
-            futures.append(self.get_authors_papers_by_s2_authors(inputs.authors))
+            futures.append(self.get_authors_papers_by_sql_authors(inputs.authors))
 
             result_sets = await custom_gather(*futures, return_exceptions=True)
-            no_exceptions_result_sets = []
-            unknown_exceptions = []
-            for result_set in result_sets:
-                if isinstance(result_set, NoAuthorMatchedError):
-                    response_text = result_set.message
+            ok_sets: list[DocumentCollection] = []
+            unknown_exceptions: list[BaseException] = []
+
+            for rs in result_sets:
+                if isinstance(rs, NoAuthorMatchedError):
                     return (
                         state,
-                        CompleteResponse(
-                            data=SearchByAuthorsOutput(response_text=response_text, doc_collection=DC.empty()),
-                        ),
+                        CompleteResponse(data=SearchByAuthorsOutput(response_text=rs.message, doc_collection=DC.empty())),
                     )
-                if isinstance(result_set, BaseException):
-                    unknown_exceptions.append(result_set)
-                    continue
-                no_exceptions_result_sets.append(result_set)
-            if len(no_exceptions_result_sets) == 0:
+                if isinstance(rs, BaseException):
+                    unknown_exceptions.append(rs)
+                else:
+                    ok_sets.append(rs)
+
+            if not ok_sets:
                 raise unknown_exceptions[0]
 
             logger.info("All results gathered, merging...")
-            results: DocumentCollection = no_exceptions_result_sets[0]
-            for no_exceptions_result_set in no_exceptions_result_sets[1:]:
-                results += no_exceptions_result_set
+            results: DocumentCollection = ok_sets[0]
+            for s in ok_sets[1:]:
+                results += s
 
             results = await self.relevance(
                 results,
@@ -375,16 +327,10 @@ class SearchByAuthorsAgent(Operative[SearchByAuthorsInput, SearchByAuthorsOutput
                 inputs.venues,
             )
 
-            # here we assume its a specific query so we need to return only a few results
             if inputs.broad_or_specific == "specific":
                 results = results.take(config_value(cfg_schema.search_by_author_agent.limit_for_specific))
-
-            # NOTE - the results are not ordered in any meaningful way, sorting will be done by caller
 
         except Exception as e:
             return None, VoidResponse(error=AgentError(type="other", message=str(e)))
 
-        return (
-            state,
-            CompleteResponse(data=SearchByAuthorsOutput(response_text="", doc_collection=results)),
-        )
+        return state, CompleteResponse(data=SearchByAuthorsOutput(response_text="", doc_collection=results))

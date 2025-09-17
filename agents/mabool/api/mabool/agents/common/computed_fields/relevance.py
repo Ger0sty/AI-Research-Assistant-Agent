@@ -76,9 +76,9 @@ def relevance_judgement_field(
     return BatchComputedField[RelevanceJudgement](
         field_name=field_name,
         computation_func=partial(_load_relevance_judgement, relevance_criteria=relevance_criteria),
-        required_fields=["markdown", "title", "abstract", "snippets", "citation_contexts"],
+        # Relax these: SQL path may not have markdown/snippets/citation_contexts pre-populated.
+        required_fields=["title", "abstract", "text"],  # was ["markdown", "title", "abstract", "snippets", "citation_contexts"]
     )
-
 
 @DI.managed
 async def _load_relevance_judgement(
@@ -123,17 +123,37 @@ async def _judge_documents_relevance(
 def _prepare_documents_for_llm(
     documents: Sequence[Document], criteria: list[RelevanceCriterion]
 ) -> list[DocumentRelevanceInput]:
-    return [
-        {
-            "document": doc["markdown"],
-            "criteria": json.dumps(
-                [{"name": criterion.name, "description": criterion.description} for criterion in criteria], indent=2
-            ),
-            "doc_id": doc["corpus_id"],
-        }
-        for doc in documents
-    ]
+    def _compose(doc: Document, limit: int = 12000) -> str:
+        # Prefer existing markdown if available
+        if doc.is_loaded("markdown") and doc.get("markdown"):
+            s = str(doc["markdown"])
+        else:
+            title = (doc.get("title") or "").strip()
+            abstract = (doc.get("abstract") or "").strip()
+            body = doc.get("text") or ""
+            parts = [p for p in (title, abstract, body) if p]
+            s = "\n\n".join(parts)
+        return s[:limit]
 
+    criteria_json = json.dumps(
+        [{"name": c.name, "description": c.description} for c in criteria],
+        indent=2
+    )
+
+    out: list[DocumentRelevanceInput] = []
+    for doc in documents:
+        composed = _compose(doc)
+        if not composed:
+            # If absolutely no text, skip this doc (or you could pass a tiny placeholder).
+            continue
+        out.append(
+            {
+                "document": composed,
+                "criteria": criteria_json,
+                "doc_id": doc["corpus_id"],
+            }
+        )
+    return out
 
 def _create_relevance_judgement_chain(criteria: list[RelevanceCriterion]) -> ChainComputation:
     relevance_result_type = _create_dynamic_judgement_result_type(criteria)

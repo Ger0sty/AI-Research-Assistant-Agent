@@ -23,6 +23,7 @@ def _find_relevant_snippet_in_doc(doc: Document, relevant_snippet: str) -> list[
     relevant_snippet_parts = [_render_relevant_snippet_text(part) for part in relevant_snippet.split(" ... ")]
     part_matches_aggregate: list[list[Snippet | CitationContext]] = [[] for _ in relevant_snippet_parts]
 
+    # title
     part_matches_aggregate = _accumulate_snippet_matches(
         part_matches_aggregate,
         doc.title,
@@ -32,6 +33,7 @@ def _find_relevant_snippet_in_doc(doc: Document, relevant_snippet: str) -> list[
         ),
     )
 
+    # abstract
     part_matches_aggregate = _accumulate_snippet_matches(
         part_matches_aggregate,
         doc.abstract,
@@ -41,6 +43,17 @@ def _find_relevant_snippet_in_doc(doc: Document, relevant_snippet: str) -> list[
         ),
     )
 
+    # NEW: body text (SQL path often lacks precomputed snippets, so search the full text)
+    part_matches_aggregate = _accumulate_snippet_matches(
+        part_matches_aggregate,
+        getattr(doc, "text", None),
+        relevant_snippet_parts,
+        lambda p, s, e: Snippet(
+            text=p, section_kind="body", section_title="body", char_start_offset=s, char_end_offset=e
+        ),
+    )
+
+    # existing precomputed snippets
     for snippet in doc.snippets or []:
         part_matches_aggregate = _accumulate_snippet_matches(
             part_matches_aggregate,
@@ -51,21 +64,22 @@ def _find_relevant_snippet_in_doc(doc: Document, relevant_snippet: str) -> list[
                 section_kind=snippet.section_kind,
                 section_title=snippet.section_title,
                 char_start_offset=(snippet.char_start_offset or 0) + s,
-                char_end_offset=(snippet.char_start_offset or 0) + e,
-            )
-            if isinstance(snippet, Snippet) and snippet.char_start_offset is not None
-            else Snippet(text=p),
+                char_end_offset=(snippet.char_end_offset or 0) + e,
+            ) if isinstance(snippet, Snippet) and snippet.char_start_offset is not None else Snippet(text=p),
         )
 
+    # citation contexts (keep, but give them finite spans for ranking)
     for context in doc.citation_contexts or []:
         part_matches_aggregate = _accumulate_snippet_matches(
             part_matches_aggregate,
             context.text,
             relevant_snippet_parts,
+            # we don't have offsets on CitationContext; wrap as CitationContext but span optimizer
+            # below will treat missing offsets as 0..len(text) instead of infinities.
             lambda p, s, e: CitationContext(text=p, source_corpus_id=context.source_corpus_id),
         )
 
-    best_spans = _choose_min_combined_span(part_matches_aggregate)
+    best_spans = _choose_min_combined_span(part_matches_aggregate, fallback_text_len=len(getattr(doc, "text", "") or ""))
     snippets: list[Snippet | CitationContext] = []
     for part, snippet in zip(relevant_snippet_parts, best_spans):
         snippets.append(snippet or Snippet(text=part))
@@ -150,31 +164,35 @@ def _fuzzy_find_snippet_text(text: str, snippet_to_find: str) -> list[tuple[int,
 
 def _choose_min_combined_span(
     part_matches_aggregate: list[list[Snippet | CitationContext]],
+    fallback_text_len: int = 0,
 ) -> list[Snippet | CitationContext | None]:
-    """
-    Given a list of lists containing Snippet objects for each snippet part,
-    this function selects one Snippet from each list such that the combined
-    span (from the minimum start to the maximum end) is the smallest possible.
-    """
     parts_found = [bool(s) for s in part_matches_aggregate]
     if not any(parts_found):
         return [None] * len(part_matches_aggregate)
 
-    # to avoid combinatorial explosion, return the first match from each part
     combo_count = 1
     for s in part_matches_aggregate:
         combo_count *= max(1, len(s))
         if combo_count > 100_000:
             return [segments[0] if segments else None for segments in part_matches_aggregate]
-    part_matches_aggregate = [s for s in part_matches_aggregate if s]  # remove parts that didn't match
+    part_matches_aggregate = [s for s in part_matches_aggregate if s]
 
     best_combination = None
     best_span_size = math.inf
 
     for combo in itertools.product(*part_matches_aggregate):
-        # combo is a tuple of (start, end) pairs, one from each snippet part
-        min_start = min(c.char_start_offset or 0 if isinstance(c, Snippet) else 0 for c in combo)
-        max_end = max(c.char_end_offset or math.inf if isinstance(c, Snippet) else math.inf for c in combo)
+        def _start(c):
+            if isinstance(c, Snippet) and c.char_start_offset is not None:
+                return c.char_start_offset
+            return 0
+        def _end(c):
+            if isinstance(c, Snippet) and c.char_end_offset is not None:
+                return c.char_end_offset
+            # If we lack offsets (e.g., CitationContext), assume a small finite span
+            return min(fallback_text_len, _start(c) + 200) if fallback_text_len else _start(c) + 200
+
+        min_start = min(_start(c) for c in combo)
+        max_end = max(_end(c) for c in combo)
         span_size = max_end - min_start
 
         if span_size < best_span_size:
@@ -184,12 +202,7 @@ def _choose_min_combined_span(
     if not best_combination:
         best_combination = [s[0] for s in part_matches_aggregate if s]
 
-    # put them back in the order they were in the input, with None for parts that didn't match
     results = []
     for part in parts_found:
-        if part:
-            results.append(best_combination.pop(0))
-        else:
-            results.append(None)
-
+        results.append(best_combination.pop(0) if part else None)
     return results

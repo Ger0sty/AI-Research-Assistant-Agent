@@ -95,3 +95,11 @@ consider_profiles_per_author = 20
 llm_model_name = "google:gemini2flash-default"
 openai_concurrency = 75
 fallback_n_suggestions = 10
+
+[default.retriever]
+type = "sql"
+
+[default.sql]
+dsn = "postgresql://user:pass@host:5432/dbname"
+pool_size = 10
+use_fts = true

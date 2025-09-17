@@ -344,11 +344,12 @@ async def add_weighted_sort_score(
 ) -> DocumentCollection:
     weights = sort_documents_input.get_sorting_weights()
     logger.info(f"Sorting weights: {weights}")
+
     collection_with_num_snippets = await collection.with_fields(
         [
             ComputedField(
                 field_name="num_snippets",
-                required_fields=["snippets"],
+                required_fields=["snippets"],  # safe: missing snippets -> 0 in lambda below
                 computation_func=Typed[PaperFinderDocument, int](lambda doc: len(doc.snippets) if doc.snippets else 0),
             ),
         ],
@@ -370,19 +371,23 @@ async def add_weighted_sort_score(
     async def weighted_sort_calculation_partial(documents: Sequence[Document]) -> Sequence[float]:
         return await weighted_sort_calculation(documents, weights)
 
+    # 🔧 Build required fields dynamically: include citation_count only if its weight is non-zero
+    required = [
+        "corpus_id",
+        "rerank_score",
+        "year",
+        "num_snippets",
+        "original_order",
+    ]
+    if (getattr(weights, "citation_count", 0) if hasattr(weights, "__dict__") else weights.get("citation_count", 0)) != 0:
+        required.append("citation_count")
+
     collection_with_final_sort_field = await collection_with_original_order.with_fields(
         [
             AggTransformComputedField[float](
                 field_name="weighted_sort_score",
                 computation_func=weighted_sort_calculation_partial,
-                required_fields=[
-                    "corpus_id",
-                    "rerank_score",
-                    "citation_count",
-                    "year",
-                    "num_snippets",
-                    "original_order",
-                ],
+                required_fields=required,
             ),
         ],
     )

@@ -40,6 +40,41 @@ logger = logging.getLogger(__name__)
 
 type FastBroadSearchState = AgentState
 
+from ai2i.config import config_value
+from mabool.data_model.config import cfg_schema
+
+def _snowball_enabled() -> bool:
+    try:
+        if config_value(cfg_schema.retriever.type) == "sql":
+            return False
+        return True  # keep default behavior on S2
+    except Exception:
+        return False
+
+def _dc_search(*, query: str, limit: int, search_iteration: int,
+               time_range, venues, fields_of_study):
+    # Dispatch to SQL or S2
+    try:
+        if config_value(cfg_schema.retriever.type) == "sql":
+            return DC.from_sql_search(
+                query=query,
+                limit=limit,
+                search_iteration=search_iteration,
+                time_range=time_range,
+                venues=venues,
+                fields_of_study=None,  # SQL usually ignores FoS
+            )
+    except Exception:
+        pass
+    return DC.from_s2_search(
+        query,
+        limit=limit,
+        search_iteration=search_iteration,
+        venues=venues,
+        time_range=time_range,
+        fields_of_study=fields_of_study,
+    )
+
 
 async def fast_broad_search(
     content_query: str,
@@ -68,7 +103,14 @@ async def _run_initial_retrieval(
     time_range: ExtractedYearlyTimeRange | None = None,
 ) -> DocumentCollection:
     dense_datasets = get_dense_datasets_by_domains(domains)
-    fields_of_study = get_fields_of_study_filter_from_domains(domains)
+
+    # FoS only matters for S2; pass None on SQL
+    fos = get_fields_of_study_filter_from_domains(domains)
+    try:
+        if config_value(cfg_schema.retriever.type) == "sql":
+            fos = None
+    except Exception:
+        pass
 
     dense_top_k = (
         config_value(cfg_schema.fast_broad_search_agent.dense_top_k)
@@ -77,7 +119,6 @@ async def _run_initial_retrieval(
     )
 
     retrieval_futures = [
-        # step reporting in gather below
         DC.from_dense_retrieval(
             queries=[content_query],
             search_iteration=1,
@@ -86,21 +127,23 @@ async def _run_initial_retrieval(
             authors=authors,
             venues=venues,
             time_range=time_range,
-            fields_of_study=fields_of_study,
+            fields_of_study=fos,
         )
         for dataset in dense_datasets
     ]
-    retrieval_futures += [
-        # step reporting in gather below
-        DC.from_s2_search(
-            content_query,
+
+    # Retriever-aware keyword search (SQL or S2)
+    retrieval_futures.append(
+        _dc_search(
+            query=content_query,
             limit=config_value(cfg_schema.fast_broad_search_agent.s2_relevance_search_top_k),
             search_iteration=1,
             venues=venues,
             time_range=time_range,
-            fields_of_study=fields_of_study,
+            fields_of_study=fos,
         )
-    ]
+    )
+
     doc_collections_or_errors = await custom_gather(*retrieval_futures, return_exceptions=True)
     for dc_or_e in doc_collections_or_errors:
         if isinstance(dc_or_e, Exception):
@@ -108,21 +151,22 @@ async def _run_initial_retrieval(
 
     doc_collection = DC.merge(dc for dc in doc_collections_or_errors if not isinstance(dc, BaseException))
     if not doc_collection:
-        logger.error("No documents retrieved from dense and s2 search")
-        raise Exception("No documents retrieved from dense and s2 search")
+        logger.error("No documents retrieved from dense and keyword search")
+        raise Exception("No documents retrieved from dense and keyword search")
 
-    doc_collection += await run_snippet_snowball(
-        content_query,
-        doc_collection,
-        top_k=config_value(cfg_schema.fast_broad_search_agent.snowball_snippets_top_k),
-        search_iteration=1,
-        fast_mode=True,
-    )
+    # Snowball only when enabled (typically S2)
+    if _snowball_enabled():
+        doc_collection += await run_snippet_snowball(
+            content_query,
+            doc_collection,
+            top_k=config_value(cfg_schema.fast_broad_search_agent.snowball_snippets_top_k),
+            search_iteration=1,
+            fast_mode=True,
+        )
 
     doc_collection = await filter_docs_by_metadata(
         doc_collection, authors=authors, venues=venues, time_range=time_range
     )
-
     return doc_collection
 
 

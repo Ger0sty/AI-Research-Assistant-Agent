@@ -4,7 +4,6 @@ from typing import Coroutine, Literal
 import pandas as pd
 from ai2i.config import config_value
 from ai2i.dcollection import BASIC_FIELDS, DocumentCollection, keyed_by_corpus_id
-from ai2i.dcollection.fetchers.s2 import check_if_paper_inserted_before, get_publication_date_from_inserted_before
 from ai2i.di import DI
 from pydantic import Field
 
@@ -35,7 +34,6 @@ class SnowballState(AgentState):
 
 
 SnowballOutput = BroadSearchOutput
-
 SnowballInput = BroadSearchInput
 
 
@@ -100,7 +98,7 @@ async def run_snowball(
 async def do_forward_snowball(
     seed_documents: DocumentCollection, snowball_config: SnowballExtendedInput
 ) -> DocumentCollection:
-    logger.info("Adding citations from S2 API for relevant documents.")
+    logger.info("Adding citations for relevant documents.")
     relevant_docs = await get_relevant_docs(seed_documents, threshold=1).with_fields(
         ["citations", "citation_count", "influential_citation_count"]
     )
@@ -111,29 +109,42 @@ async def do_forward_snowball(
     return seed_documents.merged(promoted_with_relevance)
 
 
-async def promote_top_forward_candidates(
-    documents: DocumentCollection,
-    snowball_config: SnowballExtendedInput,
-) -> DocumentCollection:
-    dff = get_forward_df(documents)
-    if dff.empty:
-        logger.info("No forward candidates found.")
-        return documents
+def _visible_at_cutoff(
+    cutoff: str | None,
+    cited_year: int | None,
+    cited_publication_date: str | None,
+) -> bool:
+    """
+    Generic replacement for S2 helpers:
+    - cutoff: ISO date string (e.g., from RoundContext.inserted_before) or None
+    - cited_year: optional int year of the cited item
+    - cited_publication_date: optional ISO datetime/date string of the cited item
+    If no cutoff is provided, everything is visible.
+    If publication_date exists, compare it to cutoff.
+    Else fall back to year comparison (year <= cutoff.year).
+    """
+    if not cutoff:
+        return True
+    try:
+        from datetime import datetime
 
-    forward_scores = get_forward_candidate_scores(dff)
-    top_corpus_ids = (
-        forward_scores.sort_values("score", ascending=False, kind="stable")
-        .head(snowball_config.forward_top_k)
-        .candidate_corpus_id.astype(str)
-        .tolist()
-    )
-    promoted_docs = await DC.from_ids(top_corpus_ids).with_fields(BASIC_FIELDS)
+        cutoff_dt = datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
+    except Exception:
+        # If cutoff format is unknown, allow all
+        return True
 
-    promoted_docs = add_snowball_origins(
-        promoted_docs, variant="forward", search_iteration=snowball_config.search_iteration
-    )
+    if cited_publication_date:
+        try:
+            cited_dt = datetime.fromisoformat(cited_publication_date.replace("Z", "+00:00"))
+            return cited_dt <= cutoff_dt
+        except Exception:
+            pass
 
-    return promoted_docs
+    if cited_year:
+        return cited_year <= cutoff_dt.year
+
+    # If we don't have usable date info, be conservative and include it.
+    return True
 
 
 @DI.managed
@@ -144,37 +155,40 @@ def get_forward_df(
     candidate_citations = []
     seed_docs = seed_document_collection.documents
     seed_docs_by_corpus_id = keyed_by_corpus_id(seed_docs)
+    cutoff = request_context.inserted_before if request_context else None
+
     for seed_doc in seed_docs:
         if seed_doc.is_loaded("citations") and seed_doc.citations:
             for citation in seed_doc.citations:
-                if request_context and not check_if_paper_inserted_before(
-                    get_publication_date_from_inserted_before(request_context.inserted_before),
-                    citation.year,
-                    citation.publication_date,
-                ):
-                    logger.warning(f"skipping citation {citation.target_corpus_id} as its after insertion date")
+                # only include if visible at cutoff (generic check; no S2 dependency)
+                if not _visible_at_cutoff(cutoff, citation.year, getattr(citation, "publication_date", None)):
+                    logger.debug(
+                        "Skipping forward candidate %s (after cutoff %s)",
+                        getattr(citation, "target_corpus_id", None),
+                        cutoff,
+                    )
                     continue
+                # avoid adding if already a seed
                 if not seed_docs_by_corpus_id.get(str(citation.target_corpus_id)):
                     candidate_citations.append(
                         {
                             "candidate_corpus_id": citation.target_corpus_id,
-                            "candidate_reference_count": citation.reference_count,
+                            "candidate_reference_count": getattr(citation, "reference_count", None),
                             "seed_corpus_id": seed_doc.corpus_id,
                             "seed_relevance": seed_doc.relevance_judgement.relevance
                             if seed_doc.relevance_judgement
                             else 0,
                             "seed_citation_count": seed_doc.citation_count,
-                            "is_influential": bool(citation.is_influential),
-                            "num_contexts": citation.num_contexts or 1,
+                            "is_influential": bool(getattr(citation, "is_influential", False)),
+                            "num_contexts": getattr(citation, "num_contexts", None) or 1,
                         }
                     )
 
     dff = pd.DataFrame(candidate_citations)
-
     if dff.empty:
         return dff
 
-    # fill missing values with median
+    # fill missing values with median / defaults
     if "candidate_reference_count" not in dff or dff.candidate_reference_count.isnull().all():
         dff["candidate_reference_count"] = 1
     else:
@@ -192,6 +206,8 @@ def get_forward_df(
 
 
 def get_forward_candidate_scores(dff: pd.DataFrame) -> pd.DataFrame:
+    if dff.empty:
+        return pd.DataFrame(columns=["candidate_corpus_id", "score"])
     forward_scores = []
     for corpus_id, group in dff.groupby("candidate_corpus_id"):
         forward_scores.append(
@@ -203,26 +219,36 @@ def get_forward_candidate_scores(dff: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(forward_scores)
 
 
-def score_forward_candidate(
-    citations: pd.DataFrame,
-    seed_relevance_bias: float = 1,
-    influential_bias: float = 0.1,
-    num_contexts_bias: float = 0,
-    candidate_citation_count_bias: float = -0.005,
-    seed_citation_count_bias: float = 0,
-) -> float:
-    return score_snowball_candidate(
-        citations,
-        direction="forward",
-        seed_relevance_bias=seed_relevance_bias,
-        influential_bias=influential_bias,
-        num_contexts_bias=num_contexts_bias,
-        candidate_citation_count_bias=candidate_citation_count_bias,
-        seed_citation_count_bias=seed_citation_count_bias,
+async def promote_top_forward_candidates(
+    documents: DocumentCollection,
+    snowball_config: SnowballExtendedInput,
+) -> DocumentCollection:
+    dff = get_forward_df(documents)
+    if dff.empty:
+        logger.info("No forward candidates found.")
+        return documents
+
+    forward_scores = get_forward_candidate_scores(dff)
+    if forward_scores.empty:
+        logger.info("No forward candidates found after scoring.")
+        return documents
+
+    top_corpus_ids = (
+        forward_scores.sort_values("score", ascending=False, kind="stable")
+        .head(snowball_config.forward_top_k)
+        .candidate_corpus_id.astype(str)
+        .tolist()
     )
+    promoted_docs = await DC.from_ids(top_corpus_ids).with_fields(BASIC_FIELDS)
+    promoted_docs = add_snowball_origins(
+        promoted_docs, variant="forward", search_iteration=snowball_config.search_iteration
+    )
+    return promoted_docs
 
 
 def get_backward_candidate_scores(dfb: pd.DataFrame) -> pd.DataFrame:
+    if dfb.empty:
+        return pd.DataFrame(columns=["candidate_corpus_id", "score"])
     backward_scores = []
     for corpus_id, group in dfb.groupby("candidate_corpus_id"):
         backward_scores.append(
@@ -245,19 +271,18 @@ def get_backward_df(seed_document_collection: DocumentCollection) -> pd.DataFram
                     candidate_citations.append(
                         {
                             "candidate_corpus_id": reference.target_corpus_id,
-                            "candidate_citation_count": reference.citation_count,
+                            "candidate_citation_count": getattr(reference, "citation_count", None),
                             "seed_corpus_id": seed_doc.corpus_id,
                             "seed_relevance": seed_doc.relevance_judgement.relevance
                             if seed_doc.relevance_judgement
                             else 0,
                             "seed_reference_count": seed_doc.reference_count,
-                            "is_influential": bool(reference.is_influential),
-                            "num_contexts": reference.num_contexts or 1,
+                            "is_influential": bool(getattr(reference, "is_influential", False)),
+                            "num_contexts": getattr(reference, "num_contexts", None) or 1,
                         }
                     )
 
     dfb = pd.DataFrame(candidate_citations)
-
     if dfb.empty:
         return dfb
 
@@ -281,7 +306,7 @@ def get_backward_df(seed_document_collection: DocumentCollection) -> pd.DataFram
 async def do_backward_snowball(
     seed_documents: DocumentCollection, snowball_config: SnowballExtendedInput
 ) -> DocumentCollection:
-    logger.info("Adding citations from S2 API for relevant documents.")
+    logger.info("Adding references for relevant documents.")
     relevant_docs = await get_relevant_docs(seed_documents, threshold=1).with_fields(
         ["references", "citation_count", "reference_count", "influential_citation_count"]
     )
@@ -302,6 +327,10 @@ async def promote_top_backward_candidates(
         return documents
 
     backwards_scores = get_backward_candidate_scores(dfb)
+    if backwards_scores.empty:
+        logger.info("No backward candidates found after scoring.")
+        return documents
+
     top_corpus_ids = (
         backwards_scores.sort_values("score", ascending=False, kind="stable")
         .head(snowball_config.backward_top_k)
@@ -309,11 +338,29 @@ async def promote_top_backward_candidates(
         .tolist()
     )
     promoted_docs = await DC.from_ids(top_corpus_ids).with_fields(BASIC_FIELDS)
-
     promoted_docs = add_snowball_origins(
         promoted_docs, variant="backward", search_iteration=snowball_config.search_iteration
     )
     return promoted_docs
+
+
+def score_forward_candidate(
+    citations: pd.DataFrame,
+    seed_relevance_bias: float = 1,
+    influential_bias: float = 0.1,
+    num_contexts_bias: float = 0,
+    candidate_citation_count_bias: float = -0.005,
+    seed_citation_count_bias: float = 0,
+) -> float:
+    return score_snowball_candidate(
+        citations,
+        direction="forward",
+        seed_relevance_bias=seed_relevance_bias,
+        influential_bias=influential_bias,
+        num_contexts_bias=num_contexts_bias,
+        candidate_citation_count_bias=candidate_citation_count_bias,
+        seed_citation_count_bias=seed_citation_count_bias,
+    )
 
 
 def score_backward_candidate(
@@ -344,25 +391,26 @@ def score_snowball_candidate(
     candidate_citation_count_bias: float = 0,
     seed_citation_count_bias: float = 0,
 ) -> float:
+    if citations.empty:
+        return 0.0
     if direction == "backward":
-        candidate_citation_count = max(citations.iloc[0]["candidate_citation_count"], len(citations))
-    elif direction == "forward":
-        candidate_citation_count = max(citations.iloc[0]["candidate_reference_count"], len(citations))
-    score = 0
+        candidate_citation_count = max(int(citations.iloc[0].get("candidate_citation_count", 1) or 1), len(citations))
+    else:  # forward
+        candidate_citation_count = max(int(citations.iloc[0].get("candidate_reference_count", 1) or 1), len(citations))
+    score = 0.0
     for _, c in citations.iterrows():
         if direction == "backward":
-            seed_citation_count = max(c["seed_reference_count"], 10)
-        elif direction == "forward":
-            seed_citation_count = max(c["seed_citation_count"], 1)
-
+            seed_citation_count = max(int(c.get("seed_reference_count", 1) or 1), 10)
+        else:  # forward
+            seed_citation_count = max(int(c.get("seed_citation_count", 1) or 1), 1)
         score += (
-            seed_relevance_bias * c["seed_relevance"]
-            + influential_bias * int(c["is_influential"])
-            + num_contexts_bias * c["num_contexts"]
+            seed_relevance_bias * float(c.get("seed_relevance", 0) or 0)
+            + influential_bias * int(bool(c.get("is_influential", False)))
+            + num_contexts_bias * int(c.get("num_contexts", 1) or 1)
             + (candidate_citation_count_bias * candidate_citation_count)
             + (seed_citation_count_bias * seed_citation_count)
         )
-    return score
+    return float(score)
 
 
 class SnowballAgent(Operative[SnowballExtendedInput, SnowballOutput, SnowballState]):

@@ -90,3 +90,6 @@ server.log*
 
 # devbox files
 **/.devbox/**
+
+# API key file
+agents/mabool/api/conf/.env.secret

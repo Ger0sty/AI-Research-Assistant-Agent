@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Literal, Optional, TypedDict, get_args
+from datetime import datetime
 
 from ai2i.chain import (
     ChainComputation,
@@ -362,24 +363,26 @@ _centrality_extraction = define_chat_llm_call(
 # Time Range Extraction #
 # --------------------- #
 
-_time_range_prompt_tmpl = """
+_CURRENT_YEAR = datetime.utcnow().year
+_time_range_prompt_tmpl = f"""
 # Task Definition
 
-The current year is 2025. Given a query for finding papers about a specific topic, extract the time range mentioned in the query, if it exists. Only extract explicit mentions of time ranges.
+The current year is {_CURRENT_YEAR}. Given a query for finding papers about a specific topic, extract the time range mentioned in the query, if it exists. Only extract explicit mentions of time ranges.
 
-Return a JSON object in the format: {"start": ..., "end": ...}. If neither field exists, return {"start": null, "end": null}.
+Return a JSON object in the format: {{"start": ..., "end": ...}}. If neither field exists, return {{"start": null, "end": null}}.
 
 # Examples
 
-{"query": "recent papers using Earth Mover's Distance (EMD) as an evaluation metric"}
-{"start": null, "end": null}
+{{"query": "recent papers using Earth Mover's Distance (EMD) as an evaluation metric"}}
+{{"start": null, "end": null}}
 
-{"query": "synthesizing answers to scientific questions from search or ranker result snippets or documents, multi-document answers synthesis, last 3 years"}
-{"start": 2023, "end": 2025}
-Reason: the last 3 years are 2025, 2024, and 2023
+{{"query": "synthesizing answers to scientific questions from search or ranker result snippets or documents, multi-document answers synthesis, last 3 years"}}
+{{"start": {_CURRENT_YEAR-2}, "end": {_CURRENT_YEAR}}}
+Reason: the last 3 years are {_CURRENT_YEAR}, {_CURRENT_YEAR-1}, and {_CURRENT_YEAR-2}
 
-{"query": "research on persona-assigned Large Language Models published in 2024"}
-{"start": 2024, "end": 2024}"""  # noqa: E501
+{{"query": "research on persona-assigned Large Language Models published in 2024"}}
+{{"start": 2024, "end": 2024}}
+"""  # noqa: E501
 
 _time_range = define_chat_llm_call(
     [system_message(_time_range_prompt_tmpl), user_message("{{query_json}}")],
@@ -457,9 +460,9 @@ _broad_or_specific_query_type = define_chat_llm_call(
 _by_title_or_name_query_type_prompt_tmpl = """
 # Task Definition
 
-Given a query for finding a specific paper, decide whether the query is looking for a paper by its title, or by some key features.
+Given a query for finding a specific paper, decide whether the query is looking for a paper by its **title**, or by some key features.
 
-If the query is looking for a paper by name, return the JSON object {"type": "title"}, otherwise return {"type": "name"}. If unsure, return {"type": "name"}.
+If the query is looking for a paper by **title**, return the JSON object {"type": "title"}, otherwise return {"type": "name"}. If unsure, return {"type": "name"}.
 
 # Examples
 
@@ -513,7 +516,7 @@ class IdentifyRelevanceCriteriaOutput(BaseModel):
     clarification_questions: Optional[list[str]] = None
 
     @model_validator(mode="after")
-    def check_at_least_one_not_none(self) -> IdentifyRelevanceCriteriaOutput:
+    def check_at_least_one_not_none(self) -> "IdentifyRelevanceCriteriaOutput":
         if self.required_relevance_critieria is None and self.clarification_questions is None:
             raise ValueError(
                 "At least one of 'required_relevance_critieria' or 'clarification_questions' must be provided."
@@ -521,7 +524,7 @@ class IdentifyRelevanceCriteriaOutput(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def check_all_criterion_names_are_distinct(self) -> IdentifyRelevanceCriteriaOutput:
+    def check_all_criterion_names_are_distinct(self) -> "IdentifyRelevanceCriteriaOutput":
         criterion_names = set()
         if self.required_relevance_critieria is not None:
             criterion_names |= {criterion.name for criterion in self.required_relevance_critieria}
@@ -535,10 +538,11 @@ class IdentifyRelevanceCriteriaOutput(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def check_weights_sum_to_one(self) -> IdentifyRelevanceCriteriaOutput:
+    def check_weights_sum_to_one(self) -> "IdentifyRelevanceCriteriaOutput":
         if self.required_relevance_critieria is not None:
-            if sum(criterion.weight for criterion in self.required_relevance_critieria) != 1:
-                raise ValueError("The sum of weights for required relevance criteria must be 1.")
+            total = sum(criterion.weight for criterion in self.required_relevance_critieria)
+            if abs(total - 1.0) > 1e-6:
+                raise ValueError("The sum of weights for required relevance criteria must be 1 (±1e-6).")
         return self
 
 
@@ -572,7 +576,7 @@ _identify_relevance_criteria = (
 
 _my_dir = Path(__file__).parent
 extract_specifications_path = _my_dir / "extract_specifications.md"
-with open(extract_specifications_path, "r") as fp:
+with open(extract_specifications_path, "r", encoding="utf-8") as fp:
     _extract_specification_prompt = fp.read()
 specification_extraction = define_chat_llm_call(
     [

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 
 from ai2i.chain import LLMEndpoint, LLMModel, Timeouts, define_llm_endpoint
@@ -11,24 +13,12 @@ from ai2i.dcollection import (
 )
 from ai2i.di import DI
 
-from mabool.agents.common.common import (
-    AgentState,
-    filter_by_author,
-)
+from mabool.agents.common.common import AgentState, filter_by_author
 from mabool.agents.common.utils import alog_args
 from mabool.agents.specific_paper_by_title.specific_paper_by_title_prompts import title_extraction
-from mabool.data_model.agent import (
-    AgentError,
-    AgentInput,
-    AgentOutput,
-)
+from mabool.data_model.agent import AgentError, AgentInput, AgentOutput
 from mabool.data_model.config import cfg_schema
-from mabool.infra.operatives import (
-    CompleteResponse,
-    Operative,
-    OperativeResponse,
-    VoidResponse,
-)
+from mabool.infra.operatives import CompleteResponse, Operative, OperativeResponse, VoidResponse
 from mabool.utils.dc import DC
 from mabool.utils.llm_utils import get_api_key_for_model
 
@@ -60,13 +50,13 @@ def get_default_endpoint() -> LLMEndpoint:
 
 def _titles_match(title1: str | None, title2: str | None) -> bool:
     def normalize_title(t: str) -> str:
+        # strip punctuation/spacing, lower, drop very short tokens to reduce noise
         t = "".join(filter(str.isalnum, t.lower()))
         return "".join([w for w in t.split() if len(w) > 3])
 
     if title1 is None or title2 is None:
         return False
-    matching = normalize_title(title1) == normalize_title(title2)
-    return matching
+    return normalize_title(title1) == normalize_title(title2)
 
 
 @DI.managed
@@ -76,7 +66,11 @@ async def get_specific_paper_by_title(
     venues: list[str] | None = None,
     authors: list[str] | None = None,
 ) -> tuple[DocumentCollection, str]:
-    extracted_title = None
+    """
+    Extract a likely title from `user_input`, then retrieve candidates from the SQL/text index.
+    Returns (DocumentCollection, extracted_title).
+    """
+    extracted_title: str | None = None
     try:
         extracted_title = await get_default_endpoint().execute(title_extraction).once(user_input)
     except Exception as e:
@@ -85,9 +79,14 @@ async def get_specific_paper_by_title(
     if not extracted_title:
         extracted_title = user_input
 
-    search_results = await DC.from_s2_by_title(extracted_title, time_range, venues)
+    # Replace S2 call with your SQL/text-index helper.
+    # If your helper is named differently (e.g., from_text_search_by_title), swap it here.
+    search_results = await DC.from_sql_by_title(extracted_title, time_range=time_range, venues=venues)
+
+    # Keep only strong title matches
     search_results = search_results.filter(lambda doc: _titles_match(doc.title, extracted_title))
 
+    # Optional author filter if provided
     if authors:
         search_results = search_results.filter(lambda doc: filter_by_author(authors, doc))
 
@@ -97,13 +96,15 @@ async def get_specific_paper_by_title(
 class SpecificPaperByTitleAgent(
     Operative[SpecificPaperByTitleInput, SpecificPaperByTitleOutput, SpecificPaperByTitleState]
 ):
-    def register(self) -> None: ...
+    def register(self) -> None:
+        ...
 
     @alog_args(log_function=logging.info)
     async def handle_operation(
         self, state: SpecificPaperByTitleState | None, inputs: SpecificPaperByTitleInput
     ) -> tuple[SpecificPaperByTitleState | None, OperativeResponse[SpecificPaperByTitleOutput]]:
         try:
+            # The analyzer has already resolved the candidate IDs; we wrap them as docs with a by-title origin.
             search_results = DC.from_docs(
                 [
                     PaperFinderDocument(
@@ -113,17 +114,14 @@ class SpecificPaperByTitleAgent(
                     for corpus_id in inputs.matched_corpus_ids
                 ]
             )
+
             if len(search_results) == 0:
                 return (
                     state,
-                    CompleteResponse(
-                        data=AgentOutput(
-                            response_text="",
-                            doc_collection=search_results,
-                        )
-                    ),
+                    CompleteResponse(data=AgentOutput(response_text="", doc_collection=search_results)),
                 )
 
+            # Provide a fixed per-doc score so downstream sorting can normalize/merge with other sources.
             search_results = await search_results.with_fields(
                 [
                     AssignedField[float](

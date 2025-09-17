@@ -185,21 +185,135 @@ async def fetch_citing_papers(
     venues: Optional[list[str]] = None,
     search_iteration: int = 1,
 ) -> DocumentCollection:
-    logger.info("Fetching citing papers from S2")
-    # Progress report handled at higher level
-    citing_papers = await DC.from_s2_citing_papers(
-        specific_paper_corpus_id,
+    # NOTE: SQL fallback: no explicit citation graph available.
+    # We approximate "citing papers" as papers that *mention* the anchor paper
+    # by title/DOI/arXiv ID in title/abstract/text, and we generate snippets locally.
+    logger.info("Fetching potential 'citing' papers from SQL via mention search")
+
+    # 1) Resolve the anchor paper (we need its title/doi/arxiv_id to build mention queries)
+    anchor_dc = await DC.from_docs([])  # placeholder init
+    try:
+        # If your DocumentCollection supports .get(doc_id) use that instead.
+        # Otherwise, requery by corpus_id to get the anchor doc’s metadata.
+        # Here we assume specific_paper_corpus_id is a stable id we can search by.
+        anchor = await DC.from_sql_lookup_by_id(specific_paper_corpus_id)  # <-- implement this helper in DC
+        if not anchor or len(anchor) == 0:
+            logger.info("Could not resolve anchor paper in SQL; returning empty collection")
+            return DC.empty()
+        anchor_doc = list(anchor.documents)[0]
+    except Exception:
+        logger.exception("Failed to resolve anchor paper; returning empty collection")
+        return DC.empty()
+
+    anchor_title = (anchor_doc.title or "").strip()
+    anchor_doi = (getattr(anchor_doc, "doi", None) or "").strip()
+    anchor_arxiv = (getattr(anchor_doc, "arxiv_id", None) or "").strip()
+
+    if not any([anchor_title, anchor_doi, anchor_arxiv]):
+        logger.info("Anchor paper has no title/doi/arxiv_id; cannot run mention search")
+        return DC.empty()
+
+    # 2) Build a conservative mention query for SQL (FTS or ILIKE fallback)
+    # Prefer doi/arxiv (precise), then quoted title (may be long). Keep it short if needed.
+    mention_terms = []
+    if anchor_doi:
+        mention_terms.append(anchor_doi)
+    if anchor_arxiv:
+        mention_terms.append(anchor_arxiv)
+    if anchor_title:
+        # Use a phrase if your FTS supports it; otherwise, plain keywords still help.
+        mention_terms.append(f'"{anchor_title}"')
+
+    # Combine mention terms with the user content query for better precision
+    # (papers that discuss the same topic AND mention the anchor).
+    # Your DC.from_sql_search should pass this straight to FTS or websearch_to_tsquery.
+    combined_query = f"{content_query} " + " ".join(mention_terms)
+
+    # 3) Retrieve candidates from SQL
+    candidates = await DC.from_sql_search(
+        query=combined_query,
+        limit=config_value(cfg_schema.broad_search_by_keyword_agent.results_limit) * 4,  # extra headroom
         search_iteration=search_iteration,
+        time_range=time_range,
+        venues=venues,
+        fields_of_study=None,
+        fields=None,
     )
-    citing_papers = await filter_docs_by_metadata(
-        docs=citing_papers,
+
+    # 4) Lightweight author/time/venue filters (reusing your existing util)
+    filtered = await filter_docs_by_metadata(
+        docs=candidates,
         time_range=time_range,
         venues=venues,
         authors=authors,
     )
-    citing_papers_with_snippets = citing_papers.filter(lambda doc: len(doc.snippets or []) > 0)
-    logger.info(f"Found {len(citing_papers)} citations, {len(citing_papers_with_snippets)} with snippets")
+
+    # 5) Generate snippets around matches so downstream reranker can use them
+    def _make_snippets(doc: Document, max_snips: int = 3, window: int = 200) -> list:
+        """
+        Create snippet windows around the first occurrences of mention terms.
+        Priority: DOI/arXiv > exact title phrase > title keywords.
+        """
+        body = (doc.text or "")[:200_000]  # safety cap
+        haystacks = []
+        if anchor_doi:
+            haystacks.append(anchor_doi)
+        if anchor_arxiv:
+            haystacks.append(anchor_arxiv)
+        if anchor_title:
+            haystacks.append(anchor_title)
+
+        snips = []
+        for needle in haystacks:
+            if not needle:
+                continue
+            idx = body.lower().find(needle.lower())
+            if idx == -1:
+                continue
+            start = max(0, idx - window)
+            end = min(len(body), idx + len(needle) + window)
+            snippet_text = body[start:end].strip()
+            if snippet_text:
+                snips.append({"text": snippet_text})
+            if len(snips) >= max_snips:
+                break
+
+        # Fallback: if nothing matched in body, try abstract/title for short snippets
+        if not snips:
+            for field in [doc.abstract or "", doc.title or ""]:
+                if not field:
+                    continue
+                if anchor_doi and anchor_doi.lower() in field.lower():
+                    snips.append({"text": field})
+                elif anchor_arxiv and anchor_arxiv.lower() in field.lower():
+                    snips.append({"text": field})
+                elif anchor_title and anchor_title.lower() in field.lower():
+                    snips.append({"text": field})
+                if len(snips) >= max_snips:
+                    break
+        return snips
+
+    # Attach snippets in-memory (your DC may provide a with_fields hook; here we mutate doc dicts for brevity)
+    docs_with_snips = []
+    for d in filtered.documents:
+        # Ensure a 'snippets' attr/list exists
+        existing_snips = getattr(d, "snippets", None) or []
+        if not existing_snips:
+            new_snips = _make_snippets(d)
+            # If Document is pydantic/immut, convert to dict then rebuild; adapt to your DC API as needed.
+            dd = d.model_dump() if hasattr(d, "model_dump") else dict(d)
+            dd["snippets"] = [{"text": s["text"]} for s in new_snips]
+            docs_with_snips.append(dd)
+        else:
+            docs_with_snips.append(d)
+
+    citing_papers_with_snippets = await DC.from_docs(docs_with_snips)
+    logger.info(
+        f"Mention search yielded {len(filtered)} candidates, "
+        f"{len(citing_papers_with_snippets.filter(lambda doc: len(doc.snippets or []) > 0))} with snippets"
+    )
     return citing_papers_with_snippets
+
 
 
 class BroadBySpecificPaperCitationState(AgentState):
