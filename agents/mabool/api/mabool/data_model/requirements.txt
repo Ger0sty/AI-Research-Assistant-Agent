@@ -1,0 +1,8 @@
+arxiv
+httpx
+pymupdf
+pandas
+pyarrow
+tqdm
+tenacity
+python-dotenv
