@@ -1,74 +1,50 @@
 import os
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional, Protocol
+from typing import List, Dict, Optional
 
 import arxiv
 import httpx
-import pymupdf as fitz  # use pymupdf (module name) to avoid name clashes
+import fitz  # PyMuPDF
 import pandas as pd
 from tenacity import retry, stop_after_attempt, wait_fixed
 from tqdm import tqdm
 from dotenv import load_dotenv
+import pyarrow
 
 load_dotenv()
 
-# ------- Config -------
 CATEGORIES = os.getenv("ARXIV_CATEGORIES", "cs.CL").split(",")
-DAYS_BACK = int(os.getenv("ARXIV_DAYS_BACK", "1"))
+MAX_RESULTS = int(os.getenv("ARXIV_MAX_RESULTS", "5"))
+DAYS_BACK = int(os.getenv("ARXIV_DAYS_BACK", "30"))
 INCLUDE_PDF_TEXT = os.getenv("INCLUDE_PDF_TEXT", "true").lower() == "true"
 OUT_PATH = os.getenv("OUT_PATH", "data/arxiv_nlp.parquet")
+
 os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
 
 PDF_HEADERS = {"User-Agent": "arxiv-nlp-dataset/0.1 (+https://arxiv.org)"}
 
-
-# ------- Networking -------
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
 def download_pdf(url: str, timeout: int = 20) -> bytes:
-    """Return raw PDF bytes; raise on failure or non-PDF responses."""
-    with httpx.Client(
-        follow_redirects=True, timeout=timeout, headers=PDF_HEADERS
-    ) as client:
-        r = client.get(url)
-        r.raise_for_status()
-        # Ensure we didn't fetch HTML or something else
-        ct = (r.headers.get("content-type") or "").lower()
-        if not r.content.startswith(b"%PDF-") and "pdf" not in ct:
-            raise ValueError(f"Not a PDF: {url} (content-type={ct})")
-        return r.content
-
-
-# ------- PDF Text Extraction (Pylance-friendly) -------
-class _Page(Protocol):
-    # Minimal protocol so Pylance knows the object has get_text(...)
-    def get_text(self, option: str = "text"):
-        ...
-
+    # return raw PDF bytes (not the Response obj)
+    with httpx.Client(follow_redirects=True, timeout=timeout, headers=PDF_HEADERS) as client:
+       try:
+            r = client.get(url)
+            r.raise_for_status()
+       except httpx.HTTPStatusError: 
+            return("Request Failed", httpx.HTTPStatusError) # type: ignore
+       return r.content
 
 def pdf_to_text(pdf_bytes: bytes) -> str:
-    """Extract text from PDF bytes; fallback to 'blocks' when plain text is empty."""
-    chunks: List[str] = []
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    try:
-        # if encrypted and empty password doesn't work, bail
-        if doc.is_encrypted and not doc.authenticate(""):
-            return ""
-
-        for i in range(doc.page_count):
-            page: _Page = doc.load_page(i)  # type: ignore # tell the type-checker this has get_text()
-            txt = page.get_text("text") or ""
+    text_chunks = []
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        for page in doc:
+            # be explicit about the extractor
+            txt = page.get_text("text") or "" # type: ignore
             if not txt.strip():
-                blk = page.get_text("blocks") or []
-                if blk:
-                    txt = "\n".join(str(b) for b in blk)
-            chunks.append(txt.strip())
+                txt = "\n".join(str(b) for b in (page.get_text("blocks") or [])) # type: ignore
+            text_chunks.append(txt)
+    return "\n".join(text_chunks).strip()
 
-        return "\n\n".join(s for s in chunks if s)
-    finally:
-        doc.close()
-
-
-# ------- Row construction -------
 def record_to_row(result: arxiv.Result, text: Optional[str]) -> Dict:
     authors = "; ".join(a.name for a in result.authors) if result.authors else ""
     primary = result.primary_category if hasattr(result, "primary_category") else ""
@@ -90,41 +66,32 @@ def record_to_row(result: arxiv.Result, text: Optional[str]) -> Dict:
         "doi": getattr(result, "doi", None),
         "comment": getattr(result, "comment", None),
         "journal_ref": getattr(result, "journal_ref", None),
-        "version": getattr(result, "versions", [{}])[-1].get("version", None)
-        if getattr(result, "versions", None)
-        else None,
+        "version": getattr(result, "versions", [{}])[-1].get("version", None) if getattr(result, "versions", None) else None,
         "text": text,
     }
 
-
 def search_query_for_category(cat: str, start: datetime) -> str:
-    # Keep simple; date filtering handled by is_within_window
     return f"cat:{cat}"
 
-
-# ------- Time helpers (typed for Optional) -------
-def ensure_aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
+def ensure_aware_utc(dt):
     if dt is None:
         return None
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
-
 def is_within_window(updated_at: Optional[datetime], start: datetime) -> bool:
-    if updated_at is None:
+    if not updated_at:
         return False
-    ua = ensure_aware_utc(updated_at)
-    sa = ensure_aware_utc(start)
-    assert ua is not None and sa is not None
-    return ua >= sa
+    updated_at = ensure_aware_utc(updated_at)
+    start = ensure_aware_utc(start) # type: ignore
+    return updated_at >= start # type: ignore
 
-
-# ------- Fetch loop -------
-def fetch_category(cat: str, start_dt: datetime) -> List[Dict]:
+def fetch_category(cat: str, start_dt: datetime, max_results: int) -> List[Dict]:
     q = search_query_for_category(cat, start_dt)
     search = arxiv.Search(
         query=q,
+        max_results=max_results,
         sort_by=arxiv.SortCriterion.SubmittedDate,  # or LastUpdatedDate
         sort_order=arxiv.SortOrder.Descending,
     )
@@ -135,75 +102,67 @@ def fetch_category(cat: str, start_dt: datetime) -> List[Dict]:
             if not is_within_window(updated, start_dt):
                 continue
 
-            text: Optional[str] = None
+            text = None
             if INCLUDE_PDF_TEXT and result.pdf_url:
                 try:
                     pdf_bytes = download_pdf(result.pdf_url)
-                    text = pdf_to_text(pdf_bytes) or None
-                except (httpx.HTTPError, ValueError, Exception):
+                    text = pdf_to_text(pdf_bytes)
+                    if not text:
+                        # keep None if extraction produced empty string
+                        text = None
+                except Exception:
                     text = None
 
             rows.append(record_to_row(result, text))
     except arxiv.UnexpectedEmptyPageError:
-        pass  # end-of-feed
-    return rows
+        # treat as end-of-feed; return what we have
+        pass
+    return rows  # <-- always return rows
 
-
-# ------- Main -------
 def main():
     start_dt = datetime.now(timezone.utc) - timedelta(days=DAYS_BACK)
     all_rows: List[Dict] = []
     seen_ids = set()
 
     for cat in CATEGORIES:
-        rows = fetch_category(cat.strip(), start_dt)
+        rows = fetch_category(cat.strip(), start_dt, MAX_RESULTS)
         for r in rows:
             if r["arxiv_id"] not in seen_ids:
                 seen_ids.add(r["arxiv_id"])
                 all_rows.append(r)
 
     if not all_rows:
-        print("No rows fetched. Try increasing DAYS_BACK or adjusting CATEGORIES.")
+        print("No rows fetched. Try increasing DAYS_BACK or MAX_RESULTS.")
         return
 
-    df = (
-        pd.DataFrame(all_rows)
-        .sort_values("updated_at", ascending=False)
-        .reset_index(drop=True)
-    )
+    df = pd.DataFrame(all_rows).sort_values("updated_at", ascending=False).reset_index(drop=True)
 
+    # Save only CSV (simplest + avoids parquet deps)
     csv_out = "data/arxiv_nlp.csv"
     parquet_out = "data/arxiv_nlp.parquet"
-    saved_parquet = False
-
-    # Try pyarrow first
+    saved = False
     try:
-        import pyarrow  # noqa: F401
         df.to_parquet(parquet_out, index=False, engine="pyarrow", compression="snappy")
         print(f"Saved Parquet (pyarrow): {parquet_out}")
-        saved_parquet = True
+        saved = True
     except Exception as e1:
         print(f"[WARN] pyarrow failed: {e1}")
-
-    # Fallback to fastparquet
-    if not saved_parquet:
+    
+    if not saved:
         try:
-            import fastparquet  # noqa: F401
-            df.to_parquet(
-                parquet_out, index=False, engine="fastparquet", compression="snappy"
-            )
+            df.to_parquet(parquet_out, index=False, engine="fastparquet", compression="snappy")
             print(f"Saved Parquet (fastparquet): {parquet_out}")
-            saved_parquet = True
+            saved = True
         except Exception as e2:
             print(f"[WARN] fastparquet failed: {e2}")
 
-    # Final fallback to CSV
-    if not saved_parquet:
+    if not saved:
         df.to_csv(csv_out, index=False)
         print(f"Saved CSV (fallback): {csv_out}")
 
-    print(f"Saved {len(df)} rows to: {parquet_out if saved_parquet else csv_out}")
 
+    df.to_csv(csv_out, index=False)
+    print(f"Saved {len(df)} rows to:\n  {csv_out}")
 
 if __name__ == "__main__":
     main()
