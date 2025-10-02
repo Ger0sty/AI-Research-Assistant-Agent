@@ -10,13 +10,17 @@ from tenacity import retry, stop_after_attempt, wait_fixed
 from tqdm import tqdm
 from dotenv import load_dotenv
 import pyarrow
+from pathlib import Path
 
-load_dotenv()
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = REPO_ROOT / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+load_dotenv(REPO_ROOT / ".env")
 
 CATEGORIES = os.getenv("ARXIV_CATEGORIES", "cs.CL").split(",")
 DAYS_BACK = int(os.getenv("ARXIV_DAYS_BACK", "30"))
 INCLUDE_PDF_TEXT = os.getenv("INCLUDE_PDF_TEXT", "true").lower() == "true"
-OUT_PATH = os.getenv("OUT_PATH", "data/arxiv_nlp.parquet")
+OUT_PATH = os.getenv("OUT_PATH", str(DATA_DIR / "arxiv_nlp.parquet"))
 
 os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
 
