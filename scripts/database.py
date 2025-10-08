@@ -1,7 +1,15 @@
+from pathlib import Path
 from sickle import Sickle
 import pandas as pd
+
+# Declare Path variables
+ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = ROOT / "data"
+DATA_DIR.mkdir(exist_ok=True)
+
 sickle = Sickle("https://oaipmh.arxiv.org/oai")
 records = sickle.ListRecords(metadataPrefix="oai_dc", set="cs:cs:CL")
+
 
 # This block of code below is essentially used to see what was being returned by OAI
 """for i, record in enumerate(records):
@@ -43,5 +51,6 @@ for i, record in enumerate(records):
 columns_initial = ['title', 'authors', 'category', 'abstract', 'date', 'type', 'OAI_identifier', 'abs_url', 'pdf_url']
 database = pd.DataFrame(data, columns=columns_initial)
 print(database)
-database.to_csv("arxiv_cscl.csv")
-database.to_parquet("arxiv_cscl.parquet")
+
+database.to_csv(DATA_DIR / "arxiv_cscl.csv", index=False)
+database.to_parquet(DATA_DIR / "arxiv_cscl.parquet", index=False)
