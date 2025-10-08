@@ -1,11 +1,5 @@
 /data
 /chroma
 .DS_Store
-# large local artifacts
-/arxiv_cscl.csv
-
-/arxiv_cscl.csv
-
-# large data artifacts
 /arxiv_cscl.csv
 /arxiv_cscl.parquet
