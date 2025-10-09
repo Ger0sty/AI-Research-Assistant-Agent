@@ -1,0 +1,32 @@
+version: "3.8"
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.1
+    platform: linux/amd64
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ports:
+      - "9200:9200"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+
+  app:
+    build: .
+    depends_on:
+      - elasticsearch
+    volumes:
+      - .:/app
+    environment:
+      - ES_URL=http://elasticsearch:9200
+      - ES_INDEX=rag_docs
+      - EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
+    command: >
+      bash -c "sleep 20 &&
+               python scripts/process_db.py &&
+               python scripts/query_data.py 'Explain transformer models' --k 3 --show-scores"
+
+volumes:
+  esdata:

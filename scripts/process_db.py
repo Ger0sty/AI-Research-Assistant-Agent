@@ -2,16 +2,16 @@ import sys
 import os
 import csv
 import shutil
+from elasticsearch import Elasticsearch
+from langchain_elasticsearch import ElasticsearchStore
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
-from langchain_community.vectorstores import Chroma
 from langchain_community.document_loaders import CSVLoader
 from langchain_huggingface import HuggingFaceEmbeddings
 from pathlib import Path
 from dotenv import load_dotenv
 
 # Load paths
-CHROMA_PATH = "chroma"
 ROOT_DIR = Path(__file__).resolve().parents[1]   # one level up from scripts/
 load_dotenv(ROOT_DIR / ".env")
 
@@ -20,7 +20,7 @@ load_dotenv(ROOT_DIR / ".env")
 def main():
     documents = load_csv()
     chunks = chunk_docs(documents)
-    save_to_chroma(chunks)
+    save_to_elasticsearch(chunks)
 
 # Loads in documents from CSV file
 def load_csv():
@@ -51,20 +51,43 @@ def chunk_docs(documents: list[Document]):
 
     return chunks
 
-def save_to_chroma(chunks: list[Document]):
-    # Clears database
-    if os.path.exists(CHROMA_PATH):
-        shutil.rmtree(CHROMA_PATH)
+def save_to_elasticsearch(chunks):
+    """
+    Save a list of LangChain Document chunks into an Elasticsearch index
+    with dense vector embeddings.
+    """
+    es_url = os.getenv("ES_URL", "http://localhost:9200")
+    es_index = os.getenv("ES_INDEX", "rag_docs")
+    model_name = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
-    # HuggingFace free embeddings
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    
-    # Creates database
-    db = Chroma.from_documents(chunks, embeddings, persist_directory=CHROMA_PATH)
+    # Initialize embedding model
+    embeddings = HuggingFaceEmbeddings(model_name=model_name)
 
-    # Save database changes
-    db.persist()
-    print(f"Saved {len(chunks)} chunks to {CHROMA_PATH}.")
+    # Connect to Elasticsearch
+    es_client = Elasticsearch(es_url)
+
+    # Delete existing index (optional for rebuilds)
+    try:
+        if es_client.indices.exists(index=es_index):
+            print(f"Deleting existing index '{es_index}'...")
+            es_client.indices.delete(index=es_index)
+    except Exception as e:
+        print(f"(warning) Could not check/delete index '{es_index}': {e}")
+
+    print(f"Creating new Elasticsearch index '{es_index}'...")
+
+    # Create index with vector field mapping
+    # (LangChain does this automatically, but we can still define our own)
+    vectorstore = ElasticsearchStore.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        index_name=es_index,
+        es_connection=es_client,
+        es_url=es_url,
+        vector_query_field="embedding",
+    )
+
+    print(f"✅ Saved {len(chunks)} chunks to Elasticsearch index '{es_index}'.")
 
 
 if __name__ == "__main__":

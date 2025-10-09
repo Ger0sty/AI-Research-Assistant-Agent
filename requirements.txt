@@ -1,0 +1,13 @@
+langchain
+langchain-community
+langchain-huggingface
+langchain-elasticsearch
+elasticsearch
+python-dotenv
+tqdm
+pandas
+pyarrow
+huggingface-hub
+torch          # required for sentence-transformers
+transformers
+sentence-transformers

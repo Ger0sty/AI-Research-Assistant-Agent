@@ -3,11 +3,9 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 # from dataclasses import dataclass
-from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain.prompts import ChatPromptTemplate
-
-CHROMA_PATH = "chroma"
+from langchain_elasticsearch import ElasticsearchStore
+from elasticsearch import Elasticsearch
 
 PROMPT_TEMPLATE = """
 Answer the question based only on the following context:
@@ -22,27 +20,37 @@ Answer the question based on the above context: {question}
 ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT_DIR / ".env")
 
-def build_db():
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    db = Chroma(
-        persist_directory = str(ROOT_DIR / CHROMA_PATH),
-        embedding_function = embeddings,
-    )
-    return db
+ES_URL = os.getenv("ES_URL", "http://localhost:9200")
+ES_INDEX = os.getenv("ES_INDEX", "rag_docs")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
-def format_sources(results):
-    sources = []
-    for doc, score in results:
+def build_store():
+    embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
+    es = Elasticsearch(ES_URL)
+    store = ElasticsearchStore(
+        index_name=ES_INDEX,
+        embedding=embeddings,
+        es_connection=es,
+        es_url=ES_URL,
+        vector_query_field="embedding",
+    )
+    return store
+
+def format_sources(results_with_scores):
+    out = []
+    for doc, score in results_with_scores:
         meta = doc.metadata or {}
-        src = meta.get("source")
-        row = meta.get("row")
-        start = meta.get("start_index")
-        sources.append({"source":src, "row":row, "start_index":start, "score":float(score) if score is not None else None,})
-    return sources
+        out.append({
+            "source": meta.get("source"),
+            "row": meta.get("row"),
+            "start_index": meta.get("start_index"),
+            "score": float(score) if score is not None else None
+        })
+    return out
 
 def main():
     # Create CLI.
-    parser = argparse.ArgumentParser(description="Query local Chroma index built with HuggingFace embeddings.")
+    parser = argparse.ArgumentParser(description="Query Elasticsearch index built with HuggingFace embeddings.")
     parser.add_argument("query_text", type=str, help="The query text.")
     parser.add_argument("--k", type=int, default=3, help="Number of results to retrieve (default: 3).")
     parser.add_argument("--min-score", type=float, default=0.0, help="Minimum score to *flag* low-quality (does not filter). Default 0.0.")
@@ -50,12 +58,12 @@ def main():
     args = parser.parse_args()
 
     query_text = args.query_text
-    db = build_db()
+    store = build_store()
 
     # Prepare the DB.
     
     # Search the DB.
-    results = db.similarity_search_with_relevance_scores(query_text, k=args.k)
+    results = store.similarity_search_with_score(query_text, k=args.k)
 
     if not results:
         print("No results returned. (Empty index or path/embedding mismatch.)")
