@@ -15,6 +15,24 @@ from dotenv import load_dotenv
 ROOT_DIR = Path(__file__).resolve().parents[1]   # one level up from scripts/
 load_dotenv(ROOT_DIR / ".env")
 
+ES_URL = os.getenv("ES_URL", "http://localhost:9200")
+ES_INDEX = os.getenv("ES_INDEX", "rag_docs")
+REBUILD = os.getenv("REBUILD", "0") == "1"
+
+es = Elasticsearch(ES_URL)
+
+# If not forcing rebuild, skip if index exists and has docs
+if not REBUILD and es.indices.exists(index=ES_INDEX):
+    info = es.count(index=ES_INDEX)
+    if info.get("count", 0) > 0:
+        print(f"✅ Index '{ES_INDEX}' already has {info['count']} docs — skipping rebuild.")
+        raise SystemExit(0)
+
+# Otherwise proceed with your current delete/create logic
+if es.indices.exists(index=ES_INDEX):
+    print(f"Deleting existing index '{ES_INDEX}'...")
+    es.indices.delete(index=ES_INDEX)
+print(f"Creating new Elasticsearch index '{ES_INDEX}'...")
 
 # Point of entry
 def main():

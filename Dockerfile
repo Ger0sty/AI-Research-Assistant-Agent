@@ -24,4 +24,4 @@ ENV PYTHONUNBUFFERED=1
 ENV CHROMA_PATH=/app/chroma
 
 # ---- Default command ----
-CMD ["bash"]
+CMD ["scripts/entrypoint.sh"]

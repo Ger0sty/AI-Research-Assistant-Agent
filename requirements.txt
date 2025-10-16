@@ -11,3 +11,5 @@ huggingface-hub
 torch          # required for sentence-transformers
 transformers
 sentence-transformers
+fastapi
+uvicorn

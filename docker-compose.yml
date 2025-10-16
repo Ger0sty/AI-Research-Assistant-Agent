@@ -13,7 +13,7 @@ services:
     volumes:
       - esdata:/usr/share/elasticsearch/data
 
-  app:
+  backend:
     build: .
     depends_on:
       - elasticsearch
@@ -23,10 +23,10 @@ services:
       - ES_URL=http://elasticsearch:9200
       - ES_INDEX=rag_docs
       - EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
-    command: >
-      bash -c "sleep 20 &&
-               python scripts/process_db.py &&
-               python scripts/query_data.py 'Explain transformer models' --k 3 --show-scores"
+      - PYTHONPATH=/app
+    ports:
+      - "8000:8000"
+    command: scripts/entrypoint.sh
 
 volumes:
   esdata:
