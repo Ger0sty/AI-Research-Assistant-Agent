@@ -1,7 +1,7 @@
 # backend/main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from .rag_service import query_rag
 
 app = FastAPI()
@@ -17,8 +17,9 @@ app.add_middleware(
 
 class SearchRequest(BaseModel):
     q: str
-    k: int = 5
+    k: int = Field(5, ge=1, le=100) 
+    show_scores: bool = True
 
 @app.post("/api/search")
 def search(req: SearchRequest):
-    return query_rag(req.q, k=req.k)
+    return query_rag(req.q, k=req.k, show_scores=req.show_scores)

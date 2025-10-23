@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_elasticsearch import ElasticsearchStore
 from elasticsearch import Elasticsearch
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+import torch
 
 PROMPT_TEMPLATE = """
 Answer the question based only on the following context:
@@ -16,6 +18,29 @@ Answer the question based only on the following context:
 
 Answer the question based on the above context: {question}
 """
+
+MODEL_ID = "google/flan-t5-base"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+model = AutoModelForSeq2SeqLM.from_pretrained(
+    MODEL_ID,
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    device_map="auto",
+)
+
+def generate_answer(context_text, question):
+    prompt = PROMPT_TEMPLATE.format(context=context_text, question=question)
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=400,
+        temperature=0.2,
+        do_sample=False
+    )
+    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return answer
+
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT_DIR / ".env")
@@ -90,6 +115,9 @@ def main():
         if args.show_scores:
             line += f" | score={entry['score']:.3f}"
         print(line)
+
+    answer = generate_answer(context_text, query_text)
+    print(answer)
 
 
 if __name__ == "__main__":
