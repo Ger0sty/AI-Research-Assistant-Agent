@@ -265,8 +265,12 @@ def query_rag(q: str, k: int = 5, show_scores: bool = True) -> Dict[str, Any]:
       }
     """
     store = _build_store()
-    chunk_limit = 5000 * k
-    results: List[Tuple] = store.similarity_search_with_score(q, k=chunk_limit)
+    chunk_limit = 10 * k
+    results: List[Tuple] = store.similarity_search_with_score(
+        q,
+        k=chunk_limit,
+        search_kwargs={"num_candidates": max(chunk_limit, k)}
+    )
 
     hits: List[Dict[str, Any]] = []
     context_parts: List[str] = []

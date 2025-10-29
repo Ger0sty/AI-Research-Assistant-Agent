@@ -8,22 +8,13 @@ services:
       - discovery.type=single-node
       - xpack.security.enabled=false
       - ES_JAVA_OPTS=-Xms1g -Xmx1g
-      - ES_TMPDIR=/usr/share/elasticsearch/tmp
-      # dev-only: relax watermarks if you keep filling the disk
-      - cluster.routing.allocation.disk.watermark.low=95%
-      - cluster.routing.allocation.disk.watermark.high=97%
-      - cluster.routing.allocation.disk.watermark.flood_stage=98%
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
+      - ES_TMPDIR=/tmp                # <— use a writable tmp
     ports:
       - "9200:9200"
     volumes:
-      - esdata:/usr/share/elasticsearch/data
+      - esdata:/usr/share/elasticsearch/data   # data stays on a volume
     tmpfs:
-      - /usr/share/elasticsearch/tmp:rw,noexec,nosuid,nodev
-
+      - /tmp:uid=1000,gid=0,mode=1777          # make /tmp writable to ES user
   backend:
     build: .
     depends_on:
