@@ -40,6 +40,20 @@ def main():
     chunks = chunk_docs(documents)
     save_to_elasticsearch(chunks)
 
+def _parse_authors(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    # handles "A; B; C" or "A, B, C"
+    parts = [p.strip() for p in raw.replace(";", ",").split(",")]
+    return [p for p in parts if p]
+
+def _coerce_int(x) -> int | None:
+    try:
+        n = int(str(x).strip())
+        return n
+    except Exception:
+        return None
+    
 # Loads in documents from CSV file
 def load_csv():
     try:
@@ -49,8 +63,69 @@ def load_csv():
 
     csv_path = ROOT_DIR / "data" / "arxiv_nlp.csv"
     loader = CSVLoader(file_path=str(csv_path))
-    documents = loader.load()
-    return documents
+    docs: list[Document] = []
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for idx, row in enumerate(reader):
+            paper_id = (
+                row.get("paper_id")
+                or row.get("arxiv_id")
+                or row.get("id")
+                or f"row-{idx}"
+            )
+            title = (
+                row.get("title")
+                or row.get("Series Name")
+                or row.get("series name")
+                or "Untitled"
+            )
+            authors = _parse_authors(row.get("authors") or row.get("Authors"))
+            venue = (
+                row.get("venue")
+                or row.get("journal_ref")
+                or row.get("Format")           # if present in your CSV
+            )
+            year = (
+                _coerce_int(row.get("year"))
+                or _coerce_int(row.get("Year"))
+            )
+            url = (
+                row.get("url")
+                or row.get("URL")
+                or (f"https://arxiv.org/abs/{row.get('arxiv_id')}" if row.get("arxiv_id") else None)
+            )
+
+            # Choose content to index: prefer abstract; else compose from fields.
+            abstract = row.get("abstract") or row.get("Abstract") or ""
+            if abstract.strip():
+                page_content = abstract.strip()
+            else:
+                # fall back: include title + any topical fields you have
+                parts = [
+                    str(title),
+                    row.get("summary") or "",
+                    row.get("content") or "",
+                    row.get("Result") or "",
+                ]
+                page_content = "\n".join(p for p in parts if p).strip()
+                if not page_content:
+                    # skip empty rows
+                    continue
+            
+            # Now we build the metadata
+            metadata = {
+                "paper_id": paper_id, 
+                "title": title,
+                "authors": authors,
+                "venue": venue,
+                "year": year,
+                "url": url,
+                "source": str(csv_path),
+                "row": idx,
+            }
+
+            docs.append(Document(page_content=page_content, metadata=metadata))
+    return docs
 
 # Chunks a list of documents
 def chunk_docs(documents: list[Document]):
