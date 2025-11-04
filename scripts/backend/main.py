@@ -4,7 +4,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional
 
+from scripts.backend.query_reanalyzer_llm import reanalyze_query_llm
 from scripts.backend.rag_service import query_rag, wait_for_index_ready
+from scripts.backend.query_analyzer_llm import analyze_query_llm
 
 app = FastAPI()
 
@@ -65,6 +67,11 @@ class SearchResponse(BaseModel):
     context: str
 # -----------------------------------------------------------------
 
+class FeedbackRequest(BaseModel):
+    query: str
+    feedback: str
+    analysis: Optional[dict] = None
+
 class SearchRequest(BaseModel):
     q: str
     k: int = Field(5, ge=1, le=100)
@@ -83,3 +90,12 @@ def search(req: SearchRequest) -> SearchResponse:
         import traceback
         traceback.print_exc()  # <--- prints the real error to logs
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/feedback")
+def handle_feedback(req: FeedbackRequest):
+    old_query = req["query"]
+    feedback = req["feedback"]
+    old_analysis = req["analysis"]
+    updated = reanalyze_query_llm(old_query, feedback, old_analysis)
+    result = query_rag(updated["updated_query"], k=5)
+    return {"new_query": updated["updated_query"], "changes": updated["changes"], "results": result}

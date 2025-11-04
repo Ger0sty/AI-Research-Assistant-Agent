@@ -19,7 +19,7 @@ Answer the question based only on the following context:
 Answer the question based on the above context: {question}
 """
 
-MODEL_ID = "google/flan-t5-base"
+MODEL_ID = "meta-llama/Llama-3.2-1B"
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 model = AutoModelForSeq2SeqLM.from_pretrained(
     MODEL_ID,
