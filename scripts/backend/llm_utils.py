@@ -1,5 +1,6 @@
 # backend/llm_utils.py
 import json
+import os
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -7,13 +8,15 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 MODEL_NAME = "meta-llama/Llama-3.2-1B"  # example; use your actual model repo name
 
 # Load model and tokenizer once
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+HF_TOKEN = os.environ.get("HUGGINGFACE_HUB_TOKEN")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, token=HF_TOKEN)
+device = "cuda" if torch.cuda.is_available() else "cpu"
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
-    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-    device_map="auto",
+    token=HF_TOKEN,
+    dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
 )
-
+model.to(device)
 def call_llm_json(prompt: str, max_new_tokens: int = 512) -> dict:
     """
     Call a local Hugging Face LLaMA model with a prompt and parse JSON output.

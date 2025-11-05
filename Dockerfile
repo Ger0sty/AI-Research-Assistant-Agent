@@ -22,6 +22,6 @@ RUN pip install --upgrade pip && \
 # ---- Environment vars ----
 ENV PYTHONUNBUFFERED=1
 ENV CHROMA_PATH=/app/chroma
-
+ENV PYTHONPATH=/app
 # ---- Default command ----
 CMD ["scripts/entrypoint.sh"]

@@ -1,6 +1,6 @@
 from typing import Dict, Any
-from backend.llm_utils import call_llm_json  # your thin wrapper
-from backend.query_analyzer_prompts import (
+from scripts.backend.llm_utils import call_llm_json  # your thin wrapper
+from scripts.backend.query_analyzer_prompts import (
     _content_extraction_prompt_tmpl,
     _author_extraction_prompt_tmpl,
     _venue_extraction_prompt_tmpl,
