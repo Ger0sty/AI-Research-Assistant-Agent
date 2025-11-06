@@ -21,10 +21,11 @@ services:
       - elasticsearch
     volumes:
       - .:/app
+    env_file:
+    - .env
     environment:
       - ES_URL=http://elasticsearch:9200
       - ES_INDEX=rag_docs
-      - HUGGINGFACE_HUB_TOKEN=${HUGGINGFACE_HUB_TOKEN}
       - EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
       - PYTHONPATH=/app
     ports:
