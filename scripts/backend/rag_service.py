@@ -2,6 +2,7 @@
 import os
 import re
 import time
+import math
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple, Optional
@@ -10,6 +11,10 @@ from dotenv import load_dotenv
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_elasticsearch import ElasticsearchStore
 from elasticsearch import Elasticsearch, NotFoundError
+from scripts.backend.query_analyzer_llm import (
+    analyze_query_llm,
+    build_refined_query,
+)
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT_DIR / ".env")
@@ -30,6 +35,44 @@ class PaperSignals:
     recency_boost: float
 
 _store = None  # cached across requests
+
+# build ES filters
+def _build_filters(analysis: dict) -> list[dict]:
+    filters: list[dict] = []
+    authors = analysis.get("authors") or []
+    venues  = analysis.get("venues") or []
+    yr      = (analysis.get("time_range") or {}) if isinstance(analysis.get("time_range"), dict) else {}
+
+    if authors:
+        filters.append({"terms": {"authors.keyword": authors}})
+    if venues:
+        filters.append({"terms": {"venue.keyword": [v.upper() for v in venues]}})
+    start, end = yr.get("start"), yr.get("end")
+    if start or end:
+        rng = {"gte": start} if start else {}
+        if end: rng["lte"] = end
+        filters.append({"range": {"year": rng}})
+    return filters
+
+def _search_by_author(es, refined_q: str, filters: list[dict], k: int):
+    must = [{"match": {"content": refined_q}}] if refined_q else []
+    body = {"query": {"bool": {"must": must, "filter": filters}}, "size": k}
+    return es.search(index=ES_INDEX, body=body)
+
+def _search_metadata_only(es, refined_q: str, filters: list[dict], k: int):
+    must = [{"match": {"title": refined_q}}] if refined_q else [{"match_all": {}}]
+    body = {"query": {"bool": {"must": must, "filter": filters}}, "size": k}
+    return es.search(index=ES_INDEX, body=body)
+
+def _search_broad(es, refined_q: str, filters: list[dict], k: int):
+    must = [{"multi_match": {"query": refined_q, "fields": ["title^3", "content"]}}] if refined_q else [{"match_all": {}}]
+    body = {"query": {"bool": {"must": must, "filter": filters}}, "size": k}
+    return es.search(index=ES_INDEX, body=body)
+
+def _search_specific_title(es, refined_q: str, filters: list[dict], k: int):
+    must = [{"match_phrase": {"title": refined_q}}] if refined_q else [{"match_all": {}}]
+    body = {"query": {"bool": {"must": must, "filter": filters}}, "size": k}
+    return es.search(index=ES_INDEX, body=body)
 
 def index_exists_with_docs(es: Elasticsearch, index: str) -> bool:
     try:
@@ -182,6 +225,262 @@ def _render_explanation(
 
     return " ".join(lines)
 
+
+_POSITIVE_EVAL = r"\b(experiment|evaluation|evaluat(e|ion)|benchmark|results|baseline|ablation)\b"
+_DATASET_HINT  = r"\b(dataset|corpus|collection|annotations?|labeled|release|we (introduce|present|release))\b"
+_METHOD_HINT   = r"\b(approach|method|model|framework|algorithm|pipeline)\b"
+
+def _has_keyword(text: str, pattern: str) -> bool:
+    return bool(re.search(pattern, text, flags=re.IGNORECASE))
+
+def _extract_short_fact(text: str, keywords: list[str], max_len: int = 180) -> Optional[str]:
+    """
+    Return one short sentence that contains any keyword; keep it concise.
+    """
+    sents = re.split(r"(?<=[.!?])\s+", text.strip())
+    keys = [k.lower() for k in keywords if k]
+    for s in sents:
+        low = s.lower()
+        if any(k in low for k in keys):
+            s = re.sub(r"\s+", " ", s).strip()
+            return (s[:max_len] + "…") if len(s) > max_len else s
+    return None
+
+def _grade_relevance(signals: PaperSignals, meta: dict, analysis: dict) -> tuple[str, float]:
+    """
+    Return (label, score_in_[0,1]).
+    """
+    score = 0.0
+    # retrieval quality
+    score += 0.45 * (1.0 / (1.0 + math.exp(-((signals.max_score or 0) - 0.5) * 2.0)))
+    score += 0.15 * min(1.0, (signals.over_threshold or 0) / 3.0)
+    score += 0.10 * (0.2 if signals.author_matched else 0.0)
+    score += 0.10 * signals.venue_boost
+    score += 0.05 * signals.recency_boost
+
+    # analyzer alignment: authors/venue/year present = small bump
+    if analysis.get("authors"): score += 0.04
+    if analysis.get("venues"):  score += 0.04
+    if (analysis.get("time_range") or {}).get("start") or (analysis.get("time_range") or {}).get("end"):
+        score += 0.02
+
+    score = max(0.0, min(1.0, score))
+    if score >= 0.75: label = "Perfectly Relevant"
+    elif score >= 0.50: label = "Relevant"
+    else: label = "Somewhat Relevant"
+    return label, score
+
+def _compose_card(meta: dict, signals: PaperSignals, analysis: dict, chunks: list[dict]) -> dict:
+    """
+    Build Asta-like justification WITHOUT pasting long chunks.
+    Produces: verdict, justification, tags, facts (short), url.
+    """
+    # gather lightweight cues from top chunk text
+    top = max(chunks, key=lambda c: float(c.get("score") or 0.0)) if chunks else {}
+    text = (top.get("content") or "")[:2500]  # small budget
+
+    # tags (boolean cues → badges)
+    tags = set()
+
+    # Focus tags from analyzer keywords intersecting with title/content
+    q_keywords = [k for k in (analysis.get("keywords") or []) if isinstance(k, str)]
+    focus_hit = _extract_short_fact(text, q_keywords) if q_keywords else None
+    if q_keywords:
+        tags.add("Query Focus")
+
+    # empirical evaluation?
+    if _has_keyword(text, _POSITIVE_EVAL):
+        tags.add("Empirical Evaluation")
+
+    # dataset/corpus?
+    if _has_keyword(text, _DATASET_HINT):
+        tags.add("Dataset/Corpus")
+
+    # method/model?
+    if _has_keyword(text, _METHOD_HINT):
+        tags.add("Method/Model")
+
+    # venue/year recency tags
+    if signals.recency_boost > 0:
+        tags.add("Recent")
+
+    venue = (meta.get("venue") or "").strip()
+    if venue:
+        tags.add(venue.upper()[:18])
+
+    # author match
+    if signals.author_matched:
+        tags.add("Author Match")
+
+    # verdict & justification (one tidy sentence)
+    label, rel = _grade_relevance(signals, meta, analysis)
+    pieces = [f"{label}:"]
+    why = []
+
+    if signals.author_matched:
+        why.append("matches requested author(s)")
+    if q_keywords:
+        why.append("focuses on your keywords")
+    if "Empirical Evaluation" in tags:
+        why.append("includes an empirical evaluation")
+    if "Dataset/Corpus" in tags:
+        why.append("releases a dataset/corpus")
+    if venue:
+        y = meta.get("year")
+        why.append(f"published at {venue}{' ' + str(y) if isinstance(y, int) else ''}")
+    elif isinstance(meta.get("year"), int):
+        why.append(f"published in {meta['year']}")
+
+    if signals.venue_boost > 0:
+        why.append("top-tier venue")
+    if signals.recency_boost > 0 and "Recent" not in tags:
+        why.append("recent")
+
+    if signals.over_threshold >= 2:
+        why.append("multiple passages scored highly")
+
+    if not why:
+        why.append("high retrieval score")
+
+    justification = " ".join(pieces) + " " + "; ".join(why) + "."
+    # short fact(s)—at most one sentence, trimmed
+    facts = []
+    if focus_hit:
+        facts.append(focus_hit)
+    else:
+        # generic fact pickers
+        for kws in [["dataset", "corpus"], ["experiment", "baseline", "results"]]:
+            s = _extract_short_fact(text, kws)
+            if s and s not in facts:
+                facts.append(s)
+            if len(facts) >= 2:
+                break
+
+    return {
+        "verdict": label,
+        "score": rel,
+        "justification": justification,
+        "tags": sorted(tags),
+        "facts": facts,            # 0–2 short sentences, not raw big chunks
+        "url": meta.get("url"),
+    }
+
+
+def _compose_explanation(paper_meta: dict, analysis: dict, signals: PaperSignals, chunks: list[dict]) -> str:
+    """
+    Turn analyzer fields + paper metadata into a short, human-readable reason.
+    Prefer analyzer filters (authors/venues/years) and include 1–2 evidence snippets.
+    """
+    title = paper_meta.get("title") or "Untitled paper"
+    venue = paper_meta.get("venue")
+    year = paper_meta.get("year")
+    url  = paper_meta.get("url")
+
+    asked_authors = analysis.get("authors") or []
+    asked_venues  = analysis.get("venues") or []
+    yr = analysis.get("time_range") or {}
+    asked_range = (yr.get("start"), yr.get("end"))
+
+    bits = []
+
+    # Header
+    if venue and year:
+        bits.append(f"Selected from {venue} {year}.")
+    elif venue:
+        bits.append(f"Selected from {venue}.")
+    elif isinstance(year, int):
+        bits.append(f"Selected ({year}).")
+    else:
+        bits.append("Selected as a strong candidate.")
+
+    # Why this paper
+    why = []
+    if asked_authors and any(a in (paper_meta.get("authors") or []) for a in asked_authors):
+        why.append("matches requested author(s)")
+    if asked_venues and venue and venue.upper() in {v.upper() for v in asked_venues}:
+        why.append("published at a requested venue")
+    if asked_range and any(asked_range):
+        s, e = asked_range
+        if isinstance(year, int) and ((s is None or year >= s) and (e is None or year <= e)):
+            why.append("falls in requested year range")
+    if signals.query_overlap_terms:
+        why.append("covers key terms: " + ", ".join(signals.query_overlap_terms))
+    if signals.over_threshold >= 2:
+        why.append(f"has multiple highly-scored passages ({signals.over_threshold}+)")
+    elif signals.max_score > 0:
+        why.append("contains a highly-scored passage")
+    if signals.venue_boost > 0:
+        why.append("strong venue")
+    if signals.recency_boost > 0:
+        why.append("recent")
+
+    if why:
+        bits.append("It was prioritized because it " + "; ".join(why) + ".")
+
+    # Evidence (top 1–2 short snippets)
+    top = sorted([c for c in chunks if isinstance(c.get("score"), (int, float))],
+                 key=lambda c: -c["score"]) or chunks
+    def short(txt: str) -> str:
+        txt = re.sub(r"\s+", " ", txt.strip())
+        return (txt[:240] + "…") if len(txt) > 260 else txt
+    snips = [short(c["content"]) for c in top[:2]]
+    if snips:
+        bits.append("Evidence:")
+        for s in snips:
+            bits.append(f"— “{s}”")
+
+    if url:
+        bits.append(f"Link: {url}")
+
+    return " ".join(bits)
+
+def _filters_from_analysis(analysis: dict) -> dict:
+    f: dict = {}
+    authors = analysis.get("authors") or []
+    venues  = analysis.get("venues") or []
+    yr      = analysis.get("time_range") or {}
+
+    if authors:
+        f["authors"] = [a.strip() for a in authors if isinstance(a, str) and a.strip()]
+    if venues:
+        f["venues"]  = [v.strip().lower() for v in venues if isinstance(v, str) and v.strip()]
+    if isinstance(yr, dict) and (yr.get("start") or yr.get("end")):
+        f["year_range"] = (yr.get("start"), yr.get("end"))
+    return f
+
+def _hit_matches_filters(hit: dict, f: dict) -> bool:
+    if not f:
+        return True
+
+    # authors (any overlap)
+    want_authors = set(a.casefold() for a in f.get("authors", []))
+    if want_authors:
+        hit_authors = set(a.casefold() for a in (hit.get("authors") or []) if isinstance(a, str))
+        if not (want_authors & hit_authors):
+            return False
+
+    # venues (case-insensitive exact token match)
+    want_venues = set(f.get("venues", []))
+    if want_venues:
+        v = hit.get("venue")
+        if not (isinstance(v, str) and v.strip().lower() in want_venues):
+            return False
+
+    # year range (inclusive)
+    if "year_range" in f:
+        start, end = f["year_range"]
+        y = hit.get("year")
+        if isinstance(y, int):
+            if start is not None and y < start:
+                return False
+            if end   is not None and y > end:
+                return False
+        else:
+            # if we require a range but hit has no year, reject
+            return False
+
+    return True
+
 def _extract_paper_meta_from_chunk(chunk: dict) -> dict:
     # Merge chunk metadata into a canonical paper-level dict
     # (Prefer chunk meta, but you could also look up in a separate paper table.)
@@ -195,7 +494,7 @@ def _extract_paper_meta_from_chunk(chunk: dict) -> dict:
         "source": chunk.get("source"),
     }
 
-def _build_paper_view(q: str, hits: list[dict]) -> list[dict]:
+def _build_paper_view(q: str, hits: list[dict], analysis: dict) -> list[dict]:
     q_terms = _norm_query_terms(q)
     by_paper = _group_hits_by_paper(hits)
     papers: list[dict] = []
@@ -209,7 +508,7 @@ def _build_paper_view(q: str, hits: list[dict]) -> list[dict]:
         for c in chunks:
             meta.update(_extract_paper_meta_from_chunk(c))
         signals = _compute_paper_signals(q_terms, meta, chunks, rel_threshold=rel_thr)
-        explanation = _render_explanation(q, meta, signals, chunks, max_snippets=2)
+        card = _compose_card(meta, signals, analysis, chunks)
 
         papers.append({
             "paper_id": pid,
@@ -218,7 +517,7 @@ def _build_paper_view(q: str, hits: list[dict]) -> list[dict]:
             "venue": meta.get("venue"),
             "year": meta.get("year"),
             "url": meta.get("url"),
-            "explanation": explanation,
+            "card": card,
             "signals": vars(signals),     # handy for UI debugging / sorting
             "evidence": chunks,           # all chunk hits for this paper
         })
@@ -252,24 +551,48 @@ def _build_store() -> ElasticsearchStore:
     return _store
 
 def query_rag(q: str, k: int = 5, show_scores: bool = True) -> Dict[str, Any]:
-    """
-    Returns:
-      {
-        "query": str,
-        "top_score": float | null,
-        "hits": [
-          {"content": str, "score": float | null, "source": str | null, "row": int | null, "start_index": int | null},
-          ...
-        ],
-        "context": str
-      }
-    """
+    # --- NEW: analyzer + refined query ---
+    analysis: dict = analyze_query_llm(q)
+    refined_q: str = build_refined_query(analysis) or q
+    filters = _build_filters(analysis)
+
+    # lightweight Python-side filter using analyzer fields
+    def _passes_filters(meta: dict) -> bool:
+        # authors
+        if any(f.get("terms", {}).get("authors.keyword") for f in filters):
+            want = {a.lower() for a in (analysis.get("authors") or [])}
+            have = {a.lower() for a in _as_author_list(meta.get("authors"))}
+            if want and want.isdisjoint(have):
+                return False
+        # venues
+        ven_terms = next(
+            (set(v.lower() for v in f["terms"]["venue.keyword"])
+             for f in filters if "terms" in f and "venue.keyword" in f["terms"]),
+            None
+        )
+        if ven_terms:
+            venue = str(meta.get("venue") or "").lower()
+            if venue and venue.lower() not in ven_terms:
+                # allow partial match (ACL 2024 vs ACL)
+                if not any(v in venue for v in ven_terms):
+                    return False
+        # years
+        rng = next((f["range"]["year"]
+                    for f in filters if "range" in f and "year" in f["range"]), None)
+        if rng:
+            y = meta.get("year")
+            if isinstance(y, int):
+                if "gte" in rng and y < rng["gte"]: return False
+                if "lte" in rng and y > rng["lte"]: return False
+        return True
+
+    # --- existing vector search, but use refined_q instead of q ---
     store = _build_store()
     chunk_limit = 10 * k
     results: List[Tuple] = store.similarity_search_with_score(
-        q,
+        refined_q,                                # << use analyzer text!
         k=chunk_limit,
-        search_kwargs={"num_candidates": max(chunk_limit, k)}
+        search_kwargs={"num_candidates": max(chunk_limit, k)},
     )
 
     hits: List[Dict[str, Any]] = []
@@ -281,6 +604,11 @@ def query_rag(q: str, k: int = 5, show_scores: bool = True) -> Dict[str, Any]:
         if i == 0:
             top_score = real_score
         meta = doc.metadata or {}
+
+        # --- NEW: drop non-matching hits early ---
+        if not _passes_filters(meta):
+            continue
+
         hit = {
             "content": doc.page_content,
             "score": real_score,
@@ -288,7 +616,6 @@ def query_rag(q: str, k: int = 5, show_scores: bool = True) -> Dict[str, Any]:
             "source": meta.get("source"),
             "row": meta.get("row"),
             "start_index": meta.get("start_index"),
-            # NEW: pass-through paper-level meta if present
             "paper_id": meta.get("paper_id"),
             "title": meta.get("title"),
             "authors": _as_author_list(meta.get("authors")),
@@ -298,7 +625,8 @@ def query_rag(q: str, k: int = 5, show_scores: bool = True) -> Dict[str, Any]:
         }
         hits.append(hit)
 
-    all_papers = _build_paper_view(q, hits)
+    # build paper view / explanations as before
+    all_papers = _build_paper_view(refined_q, hits, analysis)   # pass refined_q for overlap scoring
     top_k_papers = all_papers[:k]
 
     for p in top_k_papers:
@@ -307,6 +635,8 @@ def query_rag(q: str, k: int = 5, show_scores: bool = True) -> Dict[str, Any]:
 
     return {
         "query": q,
+        "refined_query": refined_q,          # << expose to FE for debugging
+        "analysis": analysis,                # << FE <details> shows this JSON
         "top_score": top_score if show_scores else None,
         "hits": hits,
         "papers": top_k_papers,

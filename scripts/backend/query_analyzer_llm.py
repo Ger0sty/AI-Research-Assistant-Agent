@@ -1,12 +1,8 @@
-from typing import Dict, Any
-from scripts.backend.llm_utils import call_llm_json  # your thin wrapper
-from scripts.backend.query_analyzer_prompts import (
-    _content_extraction_prompt_tmpl,
-    _author_extraction_prompt_tmpl,
-    _venue_extraction_prompt_tmpl,
-    _time_range_prompt_tmpl,
-)
-
+from __future__ import annotations
+from typing import Any, Dict, List, Optional, Literal
+import re
+from pydantic import BaseModel, Field
+from scripts.backend.llm_utils import call_llm_json
 
 PROMPT = """
 You are an expert query analyzer for a scientific paper retrieval system.
@@ -26,27 +22,176 @@ Given the user's query below, extract the following fields in JSON:
 User query: "{query}"
 """
 
-def analyze_query_llm(query: str) -> Dict[str, Any]:
+# Models
+
+class YearRange(BaseModel):
+    start: Optional[int] = None
+    end: Optional[int] = None
+    def non_empty(self) -> bool:
+        return self.start is not None or self.end is not None
+
+class ExtractedProperties(BaseModel):
+    recent_first: bool = False
+    recent_last: bool = False
+    central_first: bool = False
+    central_last: bool = False
+    specific_paper_name: Optional[str] = None
+    suitable_for_by_citing: Optional[bool] = None
+
+class QueryType(BaseModel):
+    type: Literal[
+        "BY_AUTHOR",
+        "BROAD_BY_DESCRIPTION",
+        "SPECIFIC_BY_NAME",
+        "SPECIFIC_BY_TITLE",
+        "METADATA_ONLY_NO_AUTHOR",
+        "UNKNOWN",
+    ] = "UNKNOWN"
+    broad_or_specific: Literal["broad", "specific", "unknown"] = "unknown"
+
+class AnalyzerOut(BaseModel):
+    original_query: str
+    content: str = ""
+    authors: List[str] = Field(default_factory=list)
+    venues: List[str] = Field(default_factory=list)
+    time_range: YearRange = Field(default_factory=YearRange)
+    extracted_properties: ExtractedProperties = Field(default_factory=ExtractedProperties)
+    query_type: QueryType = Field(default_factory=QueryType)
+    refined_query: str = ""  # final text to search
+
+# Hueristics
+_BY_SPLIT = re.compile(r"\b(?:papers?|work|publications?)\s+by\s+", re.I)
+_AND_SPLIT = re.compile(r"\s*(?:,|and|&|;)\s*", re.I)
+_NAME = re.compile(r"[A-Z][a-zA-Z\-\.'`]+(?:\s+[A-Z][a-zA-Z\-\.'`]+)+")
+_YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
+
+COMMON_VENUES = {"neurips","iclr","icml","acl","emnlp","naacl","kdd","chi","cvpr","eccv","iccv","icra","corl","sigir","www"}
+
+def _heuristics(q: str) -> Dict[str, Any]:
+    s = q.strip()
+    authors: List[str] = []
+    # “papers by …”
+    parts = _BY_SPLIT.split(s, maxsplit=1)
+    if len(parts) == 2:
+        rhs = parts[1]
+        chunks = [p.strip() for p in _AND_SPLIT.split(rhs) if p.strip()]
+        for ch in chunks:
+            m = _NAME.search(ch)
+            if m:
+                authors.append(m.group(0))
+    # “… papers”
+    if not authors and s.lower().endswith((" paper"," papers"," publication"," publications")):
+        core = re.sub(r"\b(papers?|publications?)\b\.?$", "", s, flags=re.I).strip()
+        authors = _NAME.findall(core)
+
+    years_found = [int(y) for y in _YEAR.findall(s)]
+    # handle explicit ranges like 2019-2023
+    range_match = re.findall(r"\b((?:19|20)\d{2})\s*[-–]\s*((?:19|20)\d{2})\b", s)
+    yr = YearRange()
+    if range_match:
+        a, b = range_match[-1]
+        yr.start, yr.end = min(int(a), int(b)), max(int(a), int(b))
+    elif years_found:
+        yr.start, yr.end = min(years_found), max(years_found)
+
+    venues = [tok.upper() for tok in re.findall(r"[A-Za-z]+", s) if tok.lower() in COMMON_VENUES]
+
+    def _dedup(seq: List[str]) -> List[str]:
+        seen = set(); out = []
+        for x in seq:
+            if x not in seen:
+                seen.add(x); out.append(x)
+        return out
+
+    return {
+        "content": s,
+        "authors": _dedup(authors),
+        "venues": _dedup(venues),
+        "time_range": yr,
+    }
+
+_SYSTEM = (
+    "Extract structured filters for an academic paper search. "
+    "Return ONLY valid JSON with keys: content (string), authors (string[]), venues (string[]), "
+    "years (number[]|null), refined_query (string). "
+    "Do not hallucinate authors; preserve any given names exactly."
+)
+
+def _prompt(user_q: str, hints: Dict[str, Any]) -> str:
+    return (
+        _SYSTEM
+        + "\nUser query: " + user_q
+        + "\nHints: " + str({
+            "authors": hints.get("authors", []),
+            "venues": hints.get("venues", []),
+            "time_range": hints.get("time_range").dict() if hints.get("time_range") else {},
+        })
+        + "\nReturn JSON only."
+    )
+
+def analyze_query_llm(user_q: str) -> Dict[str, Any]:
     """
-    Run LLM-based decomposition of a query into content, authors, venues, and years.
+    Run hybrid analysis: heuristics first, then LLM refine, then merge.
     """
-    result = {}
+    hints = _heuristics(user_q)
 
-    # Run each extractor independently
-    result["content"] = call_llm_json(f"{_content_extraction_prompt_tmpl}\n\nQuery:\n{query}").get("content")
-    result["authors"] = call_llm_json(f"{_author_extraction_prompt_tmpl}\n\nQuery:\n{query}").get("authors", [])
-    result["venues"] = call_llm_json(f"{_venue_extraction_prompt_tmpl}\n\nQuery:\n{query}").get("venues", [])
-    result["years"] = call_llm_json(f"{_time_range_prompt_tmpl}\n\nQuery:\n{query}").get("years")
+    # LLM refinement (sync wrapper returns dict)
+    llm = call_llm_json(_prompt(user_q, hints), max_new_tokens=128)
+    if not isinstance(llm, dict) or "error" in llm:
+        llm = {"content": hints["content"], "authors": [], "venues": [], "years": None, "refined_query": user_q}
 
-    # Now build a refined query for your retriever
-    result["refined_query"] = build_refined_query(result)
-    return result
+    # Merge with bias to heuristic authors
+    authors = hints["authors"] or llm.get("authors", [])
+    venues = list({*(hints.get("venues") or []), *[v for v in llm.get("venues", []) if isinstance(v, str)]})
 
+    authors = [re.sub(r"\s+", " ", a).strip(" .") for a in authors if isinstance(a, str) and a.strip()]
+    venues = [v.lower() for v in venues if isinstance(v, str) and v.strip()]
+
+    # Years → YearRange
+    yr_range = hints["time_range"]
+    yrs = llm.get("years")
+    if isinstance(yrs, list) and all(isinstance(x, int) for x in yrs) and yrs:
+        yr_range = YearRange(start=min(yrs), end=max(yrs))
+
+    # Classify query type (Asta-like)
+    qt = QueryType()
+    if authors:
+        qt = QueryType(type="BY_AUTHOR", broad_or_specific="broad")
+    elif venues or yr_range.non_empty():
+        qt = QueryType(type="METADATA_ONLY_NO_AUTHOR", broad_or_specific="broad")
+    else:
+        tokens = user_q.strip().split()
+        qt = QueryType(
+            type="BROAD_BY_DESCRIPTION" if len(tokens) <= 4 else "SPECIFIC_BY_TITLE",
+            broad_or_specific="broad" if len(tokens) <= 4 else "specific",
+        )
+
+    out = AnalyzerOut(
+        original_query=user_q,
+        content=llm.get("content") or hints["content"],
+        authors=[a for a in authors if isinstance(a, str) and a.strip()],
+        venues=[v for v in venues if isinstance(v, str) and v.strip()],
+        time_range=yr_range,
+        extracted_properties=ExtractedProperties(),
+        query_type=qt,
+        refined_query=(llm.get("refined_query") or user_q).strip(),
+    )
+    return out.dict()
 
 def build_refined_query(analysis: Dict[str, Any]) -> str:
+    """
+    Build a textual query for your retriever from the analysis dict.
+    Prefer `analysis['refined_query']` if available.
+    """
+    if isinstance(analysis.get("refined_query"), str) and analysis["refined_query"].strip():
+        return analysis["refined_query"].strip()
+
     parts = [analysis.get("content", "")]
     parts += analysis.get("authors", []) + analysis.get("venues", [])
-    yrs = analysis.get("years") or {}
-    if yrs.get("start") or yrs.get("end"):
-        parts.append(f"year:[{yrs.get('start') or '*'} TO {yrs.get('end') or '*'}]")
-    return " ".join([p for p in parts if p])
+    # FIX: read YearRange from 'time_range' instead of 'years'
+    yr = analysis.get("time_range") or {}
+    start = yr.get("start") if isinstance(yr, dict) else None
+    end = yr.get("end") if isinstance(yr, dict) else None
+    if start or end:
+        parts.append(f"year:[{start or '*'} TO {end or '*'}]")
+    return " ".join(p for p in parts if p)
