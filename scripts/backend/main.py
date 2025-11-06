@@ -2,7 +2,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Dict
 from scripts.backend.query_reanalyzer_llm import reanalyze_query_llm
 from scripts.backend.rag_service import query_rag, wait_for_index_ready
 from scripts.backend.query_analyzer_llm import analyze_query_llm
@@ -80,6 +80,14 @@ class PaperSignalsModel(BaseModel):
                 set: list,
             }
 
+class Card(BaseModel):
+    verdict: str
+    score: float
+    justification: str
+    tags: List[str]
+    facts: List[str]
+    url: Optional[str] = None
+
 class Paper(BaseModel):
     paper_id: Optional[str] = None
     title: Optional[str] = None
@@ -87,9 +95,14 @@ class Paper(BaseModel):
     venue: Optional[str] = None
     year: Optional[int] = None
     url: Optional[str] = None
+    card: Optional[Card] = None
+
+    # Fallback string (old flow)
     explanation: Optional[str] = None
+
     signals: PaperSignalsModel
-    evidence: List[Hit] = Field(dfault_factory=list)
+
+    evidence: List[Hit] = Field(default_factory=list)
 
     if _HAS_NP:
         class Config:
@@ -102,6 +115,7 @@ class Paper(BaseModel):
 
 class SearchResponse(BaseModel):
     query: str
+    refined_query: Optional[str] = None
     top_score: Optional[float] = None
     hits: List[Hit] = Field(default_factory=list)
     papers: List[Paper] = Field(default_factory=list)

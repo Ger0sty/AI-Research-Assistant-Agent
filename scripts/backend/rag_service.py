@@ -494,21 +494,84 @@ def _extract_paper_meta_from_chunk(chunk: dict) -> dict:
         "source": chunk.get("source"),
     }
 
+def _compose_one_liner(meta: dict, signals: PaperSignals, analysis: dict, refined_q: str) -> str:
+    """
+    Deterministic per-paper summary using topic, author match, overlap terms, and venue/year.
+    """
+    topic = (analysis.get("refined_query") or refined_q or "").strip()
+    if not topic:
+        kws = analysis.get("keywords") or []
+        if isinstance(kws, list) and kws:
+            topic = ", ".join(kws[:3])
+
+    bits: list[str] = []
+
+    # Always state topic relevance
+    if topic:
+        bits.append(f'is relevant to "{topic}"')
+
+    # Add paper-specific overlap terms (top 2) to make sentences differ
+    if signals.query_overlap_terms:
+        terms = ", ".join(signals.query_overlap_terms[:2])
+        bits.append(f"covers key terms: {terms}")
+
+    # Author match (only when it actually matches)
+    want = {a.strip().casefold() for a in (analysis.get("authors") or [])}
+    have = {a.strip().casefold() for a in (meta.get("authors") or [])}
+    overlap = sorted(want & have)
+    if overlap:
+        named = ", ".join(o.title() for o in overlap[:2])
+        bits.append("matches the requested author(s)" + (f": {named}" if named else ""))
+
+    # Retrieval strength
+    if signals.over_threshold >= 2:
+        bits.append("has multiple highly-scored passages")
+    elif signals.max_score > 0:
+        bits.append("has a strong top passage")
+
+    # Quality hints
+    if signals.venue_boost > 0:
+        bits.append("comes from a top-tier venue")
+    if signals.recency_boost > 0:
+        bits.append("is recent")
+
+    # Build the sentence
+    if len(bits) >= 2:
+        body = "This paper was prioritized because it " + "; ".join(bits[:-1]) + f"; and {bits[-1]}."
+    elif bits:
+        body = "This paper was prioritized because it " + bits[0] + "."
+    else:
+        body = "This paper was prioritized because it scored highly."
+
+    # Tail: venue/year if available (helps sentences differ)
+    venue = meta.get("venue")
+    year  = meta.get("year")
+    tail = " ".join(x for x in [venue, str(year) if isinstance(year, int) else None] if x)
+    if tail:
+        body += f" Published at {tail}."
+
+    return body
+
 def _build_paper_view(q: str, hits: list[dict], analysis: dict) -> list[dict]:
     q_terms = _norm_query_terms(q)
     by_paper = _group_hits_by_paper(hits)
     papers: list[dict] = []
-    # Derive a dynamic threshold using global top score (optional)
     global_max = max((h["score"] for h in hits if isinstance(h.get("score"), (int,float))), default=0.0)
     rel_thr = 0.8 * global_max if global_max else None
 
     for pid, chunks in by_paper.items():
-        # merge paper-level meta
         meta = {}
         for c in chunks:
             meta.update(_extract_paper_meta_from_chunk(c))
+
         signals = _compute_paper_signals(q_terms, meta, chunks, rel_threshold=rel_thr)
+
+        # build the Asta-style card
         card = _compose_card(meta, signals, analysis, chunks)
+
+        # overwrite (or set) the one-liner justification
+        one_liner = _compose_one_liner(meta, signals, analysis, q)
+        card["justification"] = one_liner
 
         papers.append({
             "paper_id": pid,
@@ -518,11 +581,12 @@ def _build_paper_view(q: str, hits: list[dict], analysis: dict) -> list[dict]:
             "year": meta.get("year"),
             "url": meta.get("url"),
             "card": card,
-            "signals": vars(signals),     # handy for UI debugging / sorting
-            "evidence": chunks,           # all chunk hits for this paper
+            "signals": vars(signals),
+            "evidence": chunks,  # keep for context/debug
+            # optional: keep a fallback string if your old UI still reads it
+            # "explanation": one_liner,
         })
 
-    # Sort papers by a composite score (you can tune this)
     def _paper_sort_key(p):
         s = p["signals"]
         return (
@@ -535,6 +599,7 @@ def _build_paper_view(q: str, hits: list[dict], analysis: dict) -> list[dict]:
         )
     papers.sort(key=_paper_sort_key, reverse=True)
     return papers
+
 
 def _build_store() -> ElasticsearchStore:
     global _store
@@ -554,6 +619,7 @@ def query_rag(q: str, k: int = 5, show_scores: bool = True) -> Dict[str, Any]:
     # --- NEW: analyzer + refined query ---
     analysis: dict = analyze_query_llm(q)
     refined_q: str = build_refined_query(analysis) or q
+    analysis["refined_query"] = refined_q
     filters = _build_filters(analysis)
 
     # lightweight Python-side filter using analyzer fields
