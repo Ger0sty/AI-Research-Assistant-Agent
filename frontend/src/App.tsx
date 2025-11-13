@@ -16,6 +16,10 @@ type Card = {
   tags: string[];        // badges
   facts: string[];       // 0–2 short factual sentences
   url?: string | null;
+
+  bullets?: string[];
+  evidence_quotes?: string[];
+  score_note?: string;
 };
 
 type EvidenceChunk = {
@@ -67,9 +71,11 @@ type Paper = {
 
 type SearchResponse = {
   query?: string;
+  refined_query?: string;
   top_score?: number | null;
   context?: string;
   papers: Paper[];
+  hits?: Hit[];
   results?: unknown;
   analysis?: any;
   model?: string;
@@ -145,9 +151,11 @@ function App() {
         : [];
       const normalized: SearchResponse = {
         query: raw?.results?.query ?? raw?.query,
+        refined_query: raw?.results?.refined_query ?? raw?.refined_query,
         top_score: raw?.results?.top_score ?? raw?.top_score,
         context: raw?.results?.context ?? raw?.context,
         papers: normalizedPapers,
+        hits: raw?.results?.hits ?? raw?.hits,
         results: raw?.results ?? raw,
         analysis: raw?.analysis,
         model: raw?.model,
@@ -231,6 +239,11 @@ function App() {
           Model: <code>{results.model}</code>
         </div>
       )}
+      {results?.refined_query && results.refined_query !== results.query && (
+        <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
+          Refined query: <code>{results.refined_query}</code>
+        </div>
+      )}
       {!!results?.analysis && (
         <details style={{ marginTop: 10 }}>
           <summary>Analyzer output</summary>
@@ -298,6 +311,41 @@ function App() {
                         ))}
                       </div>
                     ) : null}
+                    {/* LLM bullet list */}
+                    {p.card?.bullets && p.card.bullets.length > 0 && (
+                      <ul
+                        style={{
+                          marginTop: 10,
+                          paddingLeft: 20,
+                          fontSize: 14,
+                          opacity: 0.95,
+                        }}
+                      >
+                        {p.card.bullets.map((b, i) => (
+                          <li key={i}>{b}</li>
+                        ))}
+                      </ul>
+                    )}
+
+                    {/* LLM short quotes */}
+                    {p.card?.evidence_quotes && p.card.evidence_quotes.length > 0 && (
+                      <details style={{ marginTop: 10 }}>
+                        <summary>LLM-picked evidence</summary>
+                        <ul style={{ marginTop: 6, opacity: 0.85 }}>
+                          {p.card.evidence_quotes.map((q, i) => (
+                            <li key={i}>“{q}”</li>
+                          ))}
+                        </ul>
+                      </details>
+                    )}
+
+                    {/* optional score note */}
+                    {p.card?.score_note && (
+                      <div style={{ marginTop: 8, fontSize: 12, opacity: 0.6 }}>
+                        Note: {p.card.score_note}
+                      </div>
+                    )}
+
                     {!!p.card.facts?.length && (
                       <details style={{ marginTop: 8 }}>
                         <summary>Show Evidence</summary>

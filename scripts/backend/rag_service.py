@@ -15,6 +15,7 @@ from scripts.backend.query_analyzer_llm import (
     analyze_query_llm,
     build_refined_query,
 )
+from scripts.backend.llm_utils import call_llm_json
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT_DIR / ".env")
@@ -73,6 +74,126 @@ def _search_specific_title(es, refined_q: str, filters: list[dict], k: int):
     must = [{"match_phrase": {"title": refined_q}}] if refined_q else [{"match_all": {}}]
     body = {"query": {"bool": {"must": must, "filter": filters}}, "size": k}
     return es.search(index=ES_INDEX, body=body)
+
+_explain_cache: dict[str, dict] = {}
+
+def _name_tokens(n: str) -> list[str]:
+    return re.findall(r"[a-z]+", (n or "").lower())
+
+def _surname_set(names: list[str]) -> set[str]:
+    out = set()
+    for n in names or []:
+        toks = _name_tokens(n)
+        if toks:
+            out.add(toks[-1])
+    return out
+
+def _paper_cache_key(meta: dict, refined_q: str) -> str:
+    pid = str(meta.get("paper_id") or meta.get("title") or "")[:120]
+    y   = meta.get("year")
+    return f"{refined_q}::{pid}::{y}"
+
+def _abstract_from_chunks(chunks: list[dict], max_chars: int = 1200) -> str:
+    """Prefer any chunk that looks like an abstract; else take the top-scored text."""
+    # heuristic: if a chunk’s source/title mentions 'abstract' or it’s the first chunk
+    best = None
+    for c in sorted(chunks, key=lambda c: float(c.get("score") or 0.0), reverse=True):
+        t = (c.get("content") or "")
+        if not best:
+            best = t
+        if re.search(r"\babstract\b", (c.get("source") or "") + " " + (c.get("title") or ""), flags=re.I):
+            best = t
+            break
+    best = re.sub(r"\s+", " ", (best or "").strip())
+    return best[:max_chars]
+
+# NEW — the LLM rewriter (sync; uses your call_llm_json)
+def llm_explain_choice(meta: dict, analysis: dict, chunks: list[dict],
+                       signals: PaperSignals, refined_q: str,
+                       max_quotes: int = 2) -> dict:
+    """
+    Returns:
+      {
+        "why": str,              # 2-3 sentences, concrete
+        "bullets": [str, ...],   # up to 4 crisp reasons
+        "evidence": [str, ...],  # 0-2 short quotes (<=140 chars)
+        "score_note": str        # tiny note like 'author match + recent'
+      }
+    """
+    key = _paper_cache_key(meta, refined_q)
+    if key in _explain_cache:
+        return _explain_cache[key]
+
+    abstract = _abstract_from_chunks(chunks, 1200)
+    short_snips = []
+    for c in sorted(chunks, key=lambda c: float(c.get("score") or 0.0), reverse=True)[:max_quotes]:
+        t = re.sub(r"\s+", " ", (c.get("content") or "").strip())
+        if t:
+            short_snips.append(t[:140])
+
+    prompt = {
+        "task": "justify_selection",
+        "constraints": {
+            "max_chars": 600,
+            "avoid_generic": ["paper", "study", "approach", "method", "model"],
+            "require_concrete_terms": True,
+            "min_specific_reasons": 2,
+        },
+        "query": {
+            "original": analysis.get("original_query", "") or "",   # may not exist; ok
+            "refined": refined_q,
+            "authors": analysis.get("authors") or [],
+            "venues": analysis.get("venues") or [],
+            "time_range": analysis.get("time_range") or {},
+            "query_type": (analysis.get("query_type") or {}).get("type", "")
+        },
+        "paper": {
+            "title": meta.get("title"),
+            "authors": meta.get("authors") or [],
+            "venue": meta.get("venue"),
+            "year": meta.get("year"),
+            "url": meta.get("url")
+        },
+        "signals": {
+            "overlap_terms": signals.query_overlap_terms,
+            "author_matched": signals.author_matched,
+            "venue_boost": signals.venue_boost,
+            "recency_boost": signals.recency_boost,
+            "over_threshold": signals.over_threshold
+        },
+        "abstract": abstract,
+        "evidence_snippets": short_snips
+    }
+
+    schema = {
+        "why": "string (2-3 sentences, concrete, < 360 chars, no filler)",
+        "bullets": ["string (max 4; each < 90 chars; specific)"],
+        "evidence": ["string (<= 2 quotes; each <= 140 chars; optional)"],
+        "score_note": "string (<= 40 chars; optional)"
+    }
+
+    # Ask the LLM for strict JSON; your wrapper should return a dict or {"error": "..."}
+    generic_words = ["paper", "study", "approach", "method", "model"]
+    resp = call_llm_json(
+        f"Return ONLY JSON matching this schema:\n{schema}\n\n"
+        f"Be specific: mention at least one concept from overlap_terms or abstract nouns. "
+        f"If author filters matched, say so. If venue/year requested and satisfied, say so. "
+        f"Avoid generic words: {generic_words}.\n\n"
+        f"INPUT:\n{prompt}",
+        max_new_tokens=256
+    )
+
+    # Fallback if anything goes wrong
+    if not isinstance(resp, dict) or "why" not in resp:
+        resp = {
+            "why": _compose_one_liner(meta, signals, analysis, refined_q),
+            "bullets": [],
+            "evidence": short_snips[:max_quotes],
+            "score_note": ""
+        }
+
+    _explain_cache[key] = resp
+    return resp
 
 def index_exists_with_docs(es: Elasticsearch, index: str) -> bool:
     try:
@@ -146,7 +267,7 @@ def _compute_paper_signals(
     text_terms = _norm_query_terms(text_for_overlap)
     overlap_terms = sorted(q_terms & text_terms)
 
-    author_matched = any(a.split()[-1] in q_terms for a in paper_meta.get("authors", []) if a)
+    author_matched = bool(_surname_set(authors_list) & q_terms)
     # crude boosts you can tune later:
     venue_boost = 0.15 if any(v in venue for v in ["acl","neurips","iclr","icml","emnlp","naacl","cvpr","eccv"]) else 0.0
     year = paper_meta.get("year")
@@ -571,7 +692,13 @@ def _build_paper_view(q: str, hits: list[dict], analysis: dict) -> list[dict]:
 
         # overwrite (or set) the one-liner justification
         one_liner = _compose_one_liner(meta, signals, analysis, q)
-        card["justification"] = one_liner
+
+        # LLM justification
+        llm_just = llm_explain_choice(meta, analysis, chunks, signals, q)
+        card["justification"] = llm_just.get("why") or one_liner
+        card["bullets"] = llm_just.get("bullets", [])
+        card["evidence_quotes"] = llm_just.get("evidence", [])
+        card["score_note"] = llm_just.get("score_note", "")
 
         papers.append({
             "paper_id": pid,
@@ -581,10 +708,9 @@ def _build_paper_view(q: str, hits: list[dict], analysis: dict) -> list[dict]:
             "year": meta.get("year"),
             "url": meta.get("url"),
             "card": card,
+            "explanation": card["justification"], 
             "signals": vars(signals),
-            "evidence": chunks,  # keep for context/debug
-            # optional: keep a fallback string if your old UI still reads it
-            # "explanation": one_liner,
+            "evidence": chunks,
         })
 
     def _paper_sort_key(p):
