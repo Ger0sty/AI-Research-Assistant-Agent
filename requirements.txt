@@ -1,17 +1,24 @@
 pyyaml==6.0.2
 
-langchain
-langchain-community
-langchain-huggingface
-langchain-elasticsearch
-elasticsearch
-python-dotenv
-tqdm
-pandas
-pyarrow
-huggingface-hub
-torch          # required for sentence-transformers
-transformers
-sentence-transformers
-fastapi
-uvicorn
+# --- LangChain ecosystem (pinned) ---
+langchain==0.3.20
+langchain-community==0.3.19
+langchain-huggingface==0.3.1
+langchain-elasticsearch==0.3.2
+elasticsearch==8.15.1
+
+# --- Utility / I/O ---
+python-dotenv==1.0.1
+tqdm==4.66.6
+pandas==2.2.3
+pyarrow==16.1.0
+
+# --- Hugging Face / embeddings stack ---
+huggingface-hub==0.36.0
+torch==2.3.1
+transformers==4.46.1
+sentence-transformers==3.2.1
+
+# --- Web backend ---
+fastapi==0.115.0
+uvicorn==0.32.0

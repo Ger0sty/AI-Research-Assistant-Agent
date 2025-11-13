@@ -27,6 +27,8 @@ services:
       - HUGGINGFACE_HUB_TOKEN=${HUGGINGFACE_HUB_TOKEN}
       - EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
       - PYTHONPATH=/app
+      - USE_LLM_EXPLAIN=1
+      - MAX_EXPLAIN_PAPERS=2
     ports:
       - "8000:8000"
     command: scripts/entrypoint.sh

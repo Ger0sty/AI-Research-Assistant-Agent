@@ -23,7 +23,8 @@ load_dotenv(ROOT_DIR / ".env")
 ES_URL = os.getenv("ES_URL", "http://localhost:9200")
 ES_INDEX = os.getenv("ES_INDEX", "rag_docs")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-
+USE_LLM_EXPLAIN = os.getenv("USE_LLM_EXPLAIN", "0") == "1"
+MAX_EXPLAIN_PAPERS = int(os.getenv("MAX_EXPLAIN_PAPERS", "3"))
 @dataclass
 class PaperSignals:
     max_score: float
@@ -94,106 +95,111 @@ def _paper_cache_key(meta: dict, refined_q: str) -> str:
     return f"{refined_q}::{pid}::{y}"
 
 def _abstract_from_chunks(chunks: list[dict], max_chars: int = 1200) -> str:
-    """Prefer any chunk that looks like an abstract; else take the top-scored text."""
-    # heuristic: if a chunk’s source/title mentions 'abstract' or it’s the first chunk
-    best = None
-    for c in sorted(chunks, key=lambda c: float(c.get("score") or 0.0), reverse=True):
-        t = (c.get("content") or "")
-        if not best:
-            best = t
-        if re.search(r"\babstract\b", (c.get("source") or "") + " " + (c.get("title") or ""), flags=re.I):
-            best = t
-            break
-    best = re.sub(r"\s+", " ", (best or "").strip())
-    return best[:max_chars]
-
-# NEW — the LLM rewriter (sync; uses your call_llm_json)
-def llm_explain_choice(meta: dict, analysis: dict, chunks: list[dict],
-                       signals: PaperSignals, refined_q: str,
-                       max_quotes: int = 2) -> dict:
     """
-    Returns:
-      {
-        "why": str,              # 2-3 sentences, concrete
-        "bullets": [str, ...],   # up to 4 crisp reasons
-        "evidence": [str, ...],  # 0-2 short quotes (<=140 chars)
-        "score_note": str        # tiny note like 'author match + recent'
-      }
+    Heuristic: try to approximate the paper's abstract from the retrieved chunks.
+    - Prefer chunks whose metadata 'section' mentions 'abstract'
+    - Otherwise, take the top few chunks and squash them into ~max_chars
     """
-    key = _paper_cache_key(meta, refined_q)
-    if key in _explain_cache:
-        return _explain_cache[key]
+    if not chunks:
+        return ""
 
-    abstract = _abstract_from_chunks(chunks, 1200)
-    short_snips = []
-    for c in sorted(chunks, key=lambda c: float(c.get("score") or 0.0), reverse=True)[:max_quotes]:
-        t = re.sub(r"\s+", " ", (c.get("content") or "").strip())
-        if t:
-            short_snips.append(t[:140])
+    # Prefer explicit abstract section if present
+    abstract_candidates = []
+    for c in chunks:
+        section = str(c.get("section") or "").lower()
+        if "abstract" in section:
+            abstract_candidates.append(c.get("content") or "")
 
-    prompt = {
-        "task": "justify_selection",
-        "constraints": {
-            "max_chars": 600,
-            "avoid_generic": ["paper", "study", "approach", "method", "model"],
-            "require_concrete_terms": True,
-            "min_specific_reasons": 2,
-        },
-        "query": {
-            "original": analysis.get("original_query", "") or "",   # may not exist; ok
-            "refined": refined_q,
-            "authors": analysis.get("authors") or [],
-            "venues": analysis.get("venues") or [],
-            "time_range": analysis.get("time_range") or {},
-            "query_type": (analysis.get("query_type") or {}).get("type", "")
-        },
+    if abstract_candidates:
+        text = " ".join(abstract_candidates)
+    else:
+        # Otherwise just concatenate top-scoring chunks
+        # (callers should already pass in the paper's evidence list)
+        text = " ".join((c.get("content") or "") for c in chunks[:3])
+
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_chars:
+        text = text[:max_chars] + "…"
+    return text
+
+
+def _llm_explain_paper(
+    user_query: str,
+    paper_meta: dict,
+    analysis: dict,
+    signals: PaperSignals,
+    chunks: list[dict],
+    base_explanation: str,
+) -> str | None:
+    """
+    Ask the local LLM for a richer natural-language explanation.
+    Returns a string or None on error.
+    """
+    # Build a compact abstract + short snippets for the prompt
+    abstract_text = _abstract_from_chunks(chunks, max_chars=900)
+
+    # Take one or two short evidence snippets
+    sorted_chunks = sorted(
+        [c for c in chunks if isinstance(c.get("score"), (int, float))],
+        key=lambda c: -c["score"],
+    ) or chunks
+    def _short(txt: str) -> str:
+        txt = re.sub(r"\s+", " ", (txt or "").strip())
+        return (txt[:220] + "…") if len(txt) > 240 else txt
+
+    evidence_snips = [_short(c.get("content", "")) for c in sorted_chunks[:2]]
+
+    payload = {
+        "user_query": user_query,
+        "analysis": analysis,
         "paper": {
-            "title": meta.get("title"),
-            "authors": meta.get("authors") or [],
-            "venue": meta.get("venue"),
-            "year": meta.get("year"),
-            "url": meta.get("url")
+            "title": paper_meta.get("title"),
+            "authors": paper_meta.get("authors"),
+            "venue": paper_meta.get("venue"),
+            "year": paper_meta.get("year"),
+            "url": paper_meta.get("url"),
         },
         "signals": {
-            "overlap_terms": signals.query_overlap_terms,
+            "max_score": signals.max_score,
+            "mean_score": signals.mean_score,
+            "coverage": signals.coverage,
+            "over_threshold": signals.over_threshold,
+            "query_overlap_terms": signals.query_overlap_terms,
             "author_matched": signals.author_matched,
             "venue_boost": signals.venue_boost,
             "recency_boost": signals.recency_boost,
-            "over_threshold": signals.over_threshold
         },
-        "abstract": abstract,
-        "evidence_snippets": short_snips
+        "abstract": abstract_text,
+        "evidence_snippets": evidence_snips,
+        "baseline_explanation": base_explanation,
     }
 
-    schema = {
-        "why": "string (2-3 sentences, concrete, < 360 chars, no filler)",
-        "bullets": ["string (max 4; each < 90 chars; specific)"],
-        "evidence": ["string (<= 2 quotes; each <= 140 chars; optional)"],
-        "score_note": "string (<= 40 chars; optional)"
-    }
-
-    # Ask the LLM for strict JSON; your wrapper should return a dict or {"error": "..."}
-    generic_words = ["paper", "study", "approach", "method", "model"]
-    resp = call_llm_json(
-        f"Return ONLY JSON matching this schema:\n{schema}\n\n"
-        f"Be specific: mention at least one concept from overlap_terms or abstract nouns. "
-        f"If author filters matched, say so. If venue/year requested and satisfied, say so. "
-        f"Avoid generic words: {generic_words}.\n\n"
-        f"INPUT:\n{prompt}",
-        max_new_tokens=256
+    prompt = (
+        "You are part of a scientific paper search engine.\n"
+        "Given the user query, analysis, and one candidate paper (with abstract and evidence snippets),\n"
+        "explain in 3–6 sentences WHY this paper was selected for the query.\n"
+        "Be specific about topics, methods, datasets, and evaluation if present.\n"
+        "Avoid generic reasons like 'it is a paper' or 'it was scored highly'.\n"
+        "Do NOT invent details not supported by the abstract/snippets.\n\n"
+        "Return ONLY JSON of the form:\n"
+        "{\n"
+        '  \"why\": \"your explanation here\"\n'
+        "}\n\n"
+        f"Here is the input JSON:\n{payload}\n"
     )
 
-    # Fallback if anything goes wrong
-    if not isinstance(resp, dict) or "why" not in resp:
-        resp = {
-            "why": _compose_one_liner(meta, signals, analysis, refined_q),
-            "bullets": [],
-            "evidence": short_snips[:max_quotes],
-            "score_note": ""
-        }
-
-    _explain_cache[key] = resp
-    return resp
+    try:
+        result = call_llm_json(prompt, max_new_tokens=512)
+        text = None
+        if isinstance(result, dict):
+            text = result.get("why") or result.get("explanation") or result.get("message")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+        return None
+    except Exception as e:
+        # Log + fallback to baseline
+        print(f"[explain_paper] LLM error: {e}", flush=True)
+        return None
 
 def index_exists_with_docs(es: Elasticsearch, index: str) -> bool:
     try:
@@ -677,28 +683,21 @@ def _build_paper_view(q: str, hits: list[dict], analysis: dict) -> list[dict]:
     q_terms = _norm_query_terms(q)
     by_paper = _group_hits_by_paper(hits)
     papers: list[dict] = []
+    # Derive a dynamic threshold using global top score (optional)
     global_max = max((h["score"] for h in hits if isinstance(h.get("score"), (int,float))), default=0.0)
     rel_thr = 0.8 * global_max if global_max else None
 
     for pid, chunks in by_paper.items():
+        # merge paper-level meta
         meta = {}
         for c in chunks:
             meta.update(_extract_paper_meta_from_chunk(c))
-
         signals = _compute_paper_signals(q_terms, meta, chunks, rel_threshold=rel_thr)
-
-        # build the Asta-style card
         card = _compose_card(meta, signals, analysis, chunks)
-
-        # overwrite (or set) the one-liner justification
         one_liner = _compose_one_liner(meta, signals, analysis, q)
+        card["justification"] = one_liner
+        explanation = _compose_explanation(meta, analysis, signals, chunks)
 
-        # LLM justification
-        llm_just = llm_explain_choice(meta, analysis, chunks, signals, q)
-        card["justification"] = llm_just.get("why") or one_liner
-        card["bullets"] = llm_just.get("bullets", [])
-        card["evidence_quotes"] = llm_just.get("evidence", [])
-        card["score_note"] = llm_just.get("score_note", "")
 
         papers.append({
             "paper_id": pid,
@@ -708,11 +707,12 @@ def _build_paper_view(q: str, hits: list[dict], analysis: dict) -> list[dict]:
             "year": meta.get("year"),
             "url": meta.get("url"),
             "card": card,
-            "explanation": card["justification"], 
-            "signals": vars(signals),
-            "evidence": chunks,
+            "signals": vars(signals),     # handy for UI debugging / sorting
+            "evidence": chunks,           # all chunk hits for this paper
+            "explanation": explanation,
         })
 
+    # Sort papers by a composite score (you can tune this)
     def _paper_sort_key(p):
         s = p["signals"]
         return (
@@ -725,6 +725,71 @@ def _build_paper_view(q: str, hits: list[dict], analysis: dict) -> list[dict]:
         )
     papers.sort(key=_paper_sort_key, reverse=True)
     return papers
+
+def _enrich_papers_with_llm_explanations(
+    user_query: str, analysis: dict, papers: list[dict]
+) -> None:
+    """
+    Optionally upgrades per-paper explanations using the local LLM.
+    - Controlled by USE_LLM_EXPLAIN
+    - Only top MAX_EXPLAIN_PAPERS papers are enriched
+    - Always falls back to heuristic explanation on error
+    """
+    if not USE_LLM_EXPLAIN:
+        return
+
+    for idx, p in enumerate(papers):
+        if idx >= MAX_EXPLAIN_PAPERS:
+            break
+
+        try:
+            sig = p.get("signals") or {}
+            signals = PaperSignals(
+                max_score=sig.get("max_score", 0.0),
+                mean_score=sig.get("mean_score", 0.0),
+                coverage=sig.get("coverage", 0),
+                over_threshold=sig.get("over_threshold", 0),
+                query_overlap_terms=sig.get("query_overlap_terms", []),
+                author_matched=sig.get("author_matched", False),
+                venue_boost=sig.get("venue_boost", 0.0),
+                recency_boost=sig.get("recency_boost", 0.0),
+            )
+            meta = {
+                "paper_id": p.get("paper_id"),
+                "title": p.get("title"),
+                "authors": p.get("authors"),
+                "venue": p.get("venue"),
+                "year": p.get("year"),
+                "url": p.get("url"),
+            }
+            chunks = p.get("evidence") or []
+
+            # Baseline heuristic explanation
+            base_expl = p.get("explanation")
+            if not base_expl:
+                base_expl = _compose_explanation(meta, analysis, signals, chunks)
+
+            # Ask the LLM for an upgraded explanation
+            llm_expl = _llm_explain_paper(
+                user_query=user_query,
+                paper_meta=meta,
+                analysis=analysis,
+                signals=signals,
+                chunks=chunks,
+                base_explanation=base_expl,
+            )
+
+            explanation = llm_expl or base_expl
+
+            # Store both in the JSON we send to the frontend
+            p["explanation"] = explanation
+            if p.get("card"):
+                p["card"]["justification"] = explanation
+
+        except Exception as e:
+            # Never break the main pipeline
+            print(f"[enrich_papers] error: {e}", flush=True)
+            continue
 
 
 def _build_store() -> ElasticsearchStore:
@@ -745,7 +810,6 @@ def query_rag(q: str, k: int = 5, show_scores: bool = True) -> Dict[str, Any]:
     # --- NEW: analyzer + refined query ---
     analysis: dict = analyze_query_llm(q)
     refined_q: str = build_refined_query(analysis) or q
-    analysis["refined_query"] = refined_q
     filters = _build_filters(analysis)
 
     # lightweight Python-side filter using analyzer fields
@@ -818,8 +882,11 @@ def query_rag(q: str, k: int = 5, show_scores: bool = True) -> Dict[str, Any]:
         hits.append(hit)
 
     # build paper view / explanations as before
-    all_papers = _build_paper_view(refined_q, hits, analysis)   # pass refined_q for overlap scoring
+    all_papers = _build_paper_view(refined_q, hits, analysis)
     top_k_papers = all_papers[:k]
+
+    # NEW: optional LLM/heuristic enrichment (currently no-op unless USE_LLM_EXPLAIN=1)
+    _enrich_papers_with_llm_explanations(q, analysis, top_k_papers)
 
     for p in top_k_papers:
         for c in p["evidence"]:
