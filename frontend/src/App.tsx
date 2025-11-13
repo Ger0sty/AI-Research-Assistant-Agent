@@ -292,35 +292,21 @@ function App() {
                 {/* Preferred Asta-style card */}
                 {p.card ? (
                   <>
-                    <VerdictBand
-                      label={p.card.verdict}
-                      text={p.card.justification}
-                      tone={tone as "perfect" | "relevant" | "some"}
-                    />
                     {p.card.tags?.length ? (
-                      <div
-                        style={{
-                          display: "flex",
-                          flexWrap: "wrap",
-                          gap: 6,
-                          marginTop: 6,
-                        }}
-                      >
+                      <div style={{ marginBottom: "0.35rem", display: "flex", flexWrap: "wrap", gap: "0.35rem" }}>
                         {p.card.tags.map((t) => (
                           <Tag key={t}>{t}</Tag>
                         ))}
                       </div>
                     ) : null}
+                    {p.card.justification && (
+                      <p style={{ marginTop: "0.5rem", marginBottom: "0.75rem", lineHeight: 1.5 }}>
+                        {p.card.justification}
+                      </p>
+                    )}
                     {/* LLM bullet list */}
                     {p.card?.bullets && p.card.bullets.length > 0 && (
-                      <ul
-                        style={{
-                          marginTop: 10,
-                          paddingLeft: 20,
-                          fontSize: 14,
-                          opacity: 0.95,
-                        }}
-                      >
+                      <ul style={{ marginTop: "0.35rem", marginLeft: "1.25rem" }}>
                         {p.card.bullets.map((b, i) => (
                           <li key={i}>{b}</li>
                         ))}
@@ -329,14 +315,14 @@ function App() {
 
                     {/* LLM short quotes */}
                     {p.card?.evidence_quotes && p.card.evidence_quotes.length > 0 && (
-                      <details style={{ marginTop: 10 }}>
-                        <summary>LLM-picked evidence</summary>
-                        <ul style={{ marginTop: 6, opacity: 0.85 }}>
+                      <>
+                        <div style={{ marginTop: "0.35rem", fontSize: "0.9rem", opacity: 0.85 }}>LLM-picked evidence</div>
+                        <ul style={{ marginTop: "0.15rem", marginLeft: "1.25rem" }}>
                           {p.card.evidence_quotes.map((q, i) => (
                             <li key={i}>“{q}”</li>
                           ))}
                         </ul>
-                      </details>
+                      </>
                     )}
 
                     {/* optional score note */}

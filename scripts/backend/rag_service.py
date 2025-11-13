@@ -2,6 +2,7 @@
 import os
 import re
 import time
+import json
 import math
 from collections import defaultdict
 from dataclasses import dataclass
@@ -16,9 +17,8 @@ from scripts.backend.query_analyzer_llm import (
     build_refined_query,
 )
 from scripts.backend.llm_utils import call_llm_json
-
 ROOT_DIR = Path(__file__).resolve().parents[1]
-load_dotenv(ROOT_DIR / ".env")
+load_dotenv(ROOT_DIR / ".env", override=False)
 
 ES_URL = os.getenv("ES_URL", "http://localhost:9200")
 ES_INDEX = os.getenv("ES_INDEX", "rag_docs")
@@ -694,8 +694,6 @@ def _build_paper_view(q: str, hits: list[dict], analysis: dict) -> list[dict]:
             meta.update(_extract_paper_meta_from_chunk(c))
         signals = _compute_paper_signals(q_terms, meta, chunks, rel_threshold=rel_thr)
         card = _compose_card(meta, signals, analysis, chunks)
-        one_liner = _compose_one_liner(meta, signals, analysis, q)
-        card["justification"] = one_liner
         explanation = _compose_explanation(meta, analysis, signals, chunks)
 
 
@@ -891,7 +889,7 @@ def query_rag(q: str, k: int = 5, show_scores: bool = True) -> Dict[str, Any]:
     for p in top_k_papers:
         for c in p["evidence"]:
             context_parts.append(c["content"])
-
+    print("DEBUG PAPERS OUT:", json.dumps(all_papers, indent=2)[:2000])
     return {
         "query": q,
         "refined_query": refined_q,          # << expose to FE for debugging
