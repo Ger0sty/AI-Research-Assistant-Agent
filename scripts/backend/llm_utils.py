@@ -1,6 +1,7 @@
 # backend/llm_utils.py
 import json
 import os
+import re
 import torch
 from functools import lru_cache
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -21,58 +22,120 @@ def get_model_and_tokenizer():
     mdl.to(device); mdl.eval()
     return tok, mdl
 
-def call_llm_json(prompt: str, max_new_tokens: int = 256) -> dict:
+def call_llm_json(prompt: str, max_new_tokens: int = 512, system: str = None) -> dict:
     """
-    Run a local Hugging Face model and robustly extract the first JSON object.
-    Handles single quotes, trailing commas, and text before/after JSON.
+    Calls a chat-formatted LLaMA model using apply_chat_template,
+    guaranteeing that system and user messages are separated.
+    Returns the FIRST valid JSON object found in the assistant reply.
     """
     try:
         tok, mdl = get_model_and_tokenizer()
 
-        system_prompt = (
-            "You are a scientific reasoning assistant that outputs ONLY valid JSON.\n"
-            "Your response must be exactly one JSON object of the form:\n"
-            "{\n  \"why\": \"your explanation here\"\n}\n"
-        )
-        full_prompt = system_prompt + prompt
+        # Default system instruction if none provided
+        if system is None:
+            system = (
+                "You are a scientific reasoning assistant. "
+                "You must output ONLY valid JSON. "
+                "Never include extra commentary, explanations, or examples."
+            )
 
-        inputs = tok(full_prompt, return_tensors="pt", truncation=True, max_length=1024).to(mdl.device)
+        # Chat-style message list
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt}
+        ]
+
+        # Convert chat messages to model input
+        inputs = tok.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt"
+        ).to(mdl.device)
 
         with torch.inference_mode():
             out = mdl.generate(
-                **inputs,
+                inputs,
                 max_new_tokens=max_new_tokens,
                 pad_token_id=tok.eos_token_id,
                 do_sample=False,
             )
 
         text = tok.decode(out[0], skip_special_tokens=True)
-        print("[DEBUG] Raw text from LLM passthrough:", text, flush=True)
-        # --- Extract JSON-like substring ---
-        i, j = text.find("{"), text.rfind("}")
-        if i < 0 or j < 0:
-            print("[DEBUG] No braces found in LLM output:", text[:400], flush=True)
-            return {"error": "No JSON braces found", "raw_output": text}
+        print("[DEBUG] Raw LLM chat output:", text, flush=True)
+
+        # --- Extract FIRST JSON object only ---
+        i = text.find("{")
+        if i < 0:
+            return {"error": "No JSON found", "raw_output": text}
+        j = text.find("}", i)
+        if j < 0:
+            return {"error": "No closing brace", "raw_output": text}
 
         json_str = text[i:j+1]
 
-        # --- Sanitize: replace single quotes with double, remove newlines ---
-        json_str_clean = (
-            json_str
-            .replace("'", '"')
-            .replace("\n", " ")
-            .replace("\\n", " ")
-            .strip()
-        )
-
-        try:
-            data = json.loads(json_str_clean)
-            print("[DEBUG] Parsed sanitized JSON:", data, flush=True)
-            return data
-        except json.JSONDecodeError as e:
-            print(f"[DEBUG] JSON parse failed ({e}); returning raw text", flush=True)
-            return {"error": f"Bad JSON: {e}", "raw_output": text}
+        # Clean and parse
+        json_str = json_str.replace("\n", " ").strip()
+        data = json.loads(json_str)
+        print("[DEBUG] Parsed JSON:", data, flush=True)
+        return data
 
     except Exception as e:
-        print(f"[call_llm_json] ERROR: {e}", flush=True)
-        return {"error": f"LLM call failed: {e}"}
+        print("[call_llm_json] ERROR:", e, flush=True)
+        return {"error": str(e)}
+
+def call_llm_json_last(prompt: str, max_new_tokens: int = 512, system: str = None) -> dict:
+    """
+    Same as call_llm_json, but extracts the LAST JSON object from the LLM output.
+    Required for paper explanations because the model prints example JSON first.
+    """
+    # First, get the raw text using your existing logic
+    try:
+        tok, mdl = get_model_and_tokenizer()
+
+        if system is None:
+            system = (
+                "You are a scientific reasoning assistant. "
+                "You must output ONLY valid JSON. "
+                "Never include extra commentary or multiple JSON blocks."
+            )
+
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt}
+        ]
+
+        inputs = tok.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt"
+        ).to(mdl.device)
+
+        with torch.inference_mode():
+            out = mdl.generate(
+                inputs,
+                max_new_tokens=max_new_tokens,
+                pad_token_id=tok.eos_token_id,
+                do_sample=False,
+            )
+
+        text = tok.decode(out[0], skip_special_tokens=True)
+        print("[DEBUG] Raw LLM chat output:", text, flush=True)
+
+        # Find ALL { ... } objects
+        json_candidates = re.findall(r"\{.*?\}", text, flags=re.DOTALL)
+
+        if not json_candidates:
+            return {"error": "No JSON object found", "raw_output": text}
+
+        # Take the LAST JSON object
+        json_str = json_candidates[-1].replace("\n", " ").strip()
+
+        data = json.loads(json_str)
+        print("[DEBUG] Parsed LAST JSON:", data, flush=True)
+        return data
+
+    except Exception as e:
+        print("[call_llm_json_last] ERROR:", e, flush=True)
+        return {"error": str(e)}

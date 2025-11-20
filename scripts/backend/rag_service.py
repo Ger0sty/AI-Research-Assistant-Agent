@@ -16,8 +16,9 @@ from scripts.backend.query_analyzer_llm import (
     analyze_query_llm,
     build_refined_query,
 )
-from scripts.backend.llm_utils import cal
-l_llm_json
+from scripts.backend.llm_utils import (
+    call_llm_json_last,
+)
 ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT_DIR / ".env", override=False)
 
@@ -191,7 +192,7 @@ def _llm_explain_paper(
     
     try:
         print(f"[DEBUG] calling LLM for paper: {paper_meta.get('title')}", flush=True)
-        result = call_llm_json(prompt, max_new_tokens=512)
+        result = call_llm_json_last(prompt, max_new_tokens=512)
         text = None
 
         # Primary case: JSON output

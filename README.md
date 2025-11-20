@@ -3,6 +3,7 @@
 # Running the Docker container
 In order to run the Docker container, first start the Docker app. Then, run the following command in your terminal:
 ```
+docker compose down -v
 docker compose up --build
 ```
 
