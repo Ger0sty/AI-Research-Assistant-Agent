@@ -16,7 +16,8 @@ from scripts.backend.query_analyzer_llm import (
     analyze_query_llm,
     build_refined_query,
 )
-from scripts.backend.llm_utils import call_llm_json
+from scripts.backend.llm_utils import cal
+l_llm_json
 ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT_DIR / ".env", override=False)
 
@@ -187,19 +188,36 @@ def _llm_explain_paper(
         "}\n\n"
         f"Here is the input JSON:\n{payload}\n"
     )
-
+    
     try:
+        print(f"[DEBUG] calling LLM for paper: {paper_meta.get('title')}", flush=True)
         result = call_llm_json(prompt, max_new_tokens=512)
         text = None
+
+        # Primary case: JSON output
         if isinstance(result, dict):
             text = result.get("why") or result.get("explanation") or result.get("message")
+
+        # Secondary case: model returned raw string (not JSON)
+        elif isinstance(result, str):
+            text = result.strip()
+
+        # Fallback: accept stringified JSON fragments
+        elif hasattr(result, "__str__"):
+            s = str(result).strip()
+            if s and len(s) > 10:
+                text = s
+
         if isinstance(text, str) and text.strip():
+            print("[DEBUG] Parsed LLM explanation:", text[:200], flush=True)
             return text.strip()
+
+        print("[DEBUG] LLM returned unparseable result:", repr(result)[:400], flush=True)
         return None
     except Exception as e:
-        # Log + fallback to baseline
         print(f"[explain_paper] LLM error: {e}", flush=True)
         return None
+
 
 def index_exists_with_docs(es: Elasticsearch, index: str) -> bool:
     try:
@@ -727,6 +745,7 @@ def _build_paper_view(q: str, hits: list[dict], analysis: dict) -> list[dict]:
 def _enrich_papers_with_llm_explanations(
     user_query: str, analysis: dict, papers: list[dict]
 ) -> None:
+    print(f"[DEBUG] USE_LLM_EXPLAIN={USE_LLM_EXPLAIN}, papers={len(papers)}", flush=True)
     """
     Optionally upgrades per-paper explanations using the local LLM.
     - Controlled by USE_LLM_EXPLAIN
@@ -777,12 +796,15 @@ def _enrich_papers_with_llm_explanations(
                 base_explanation=base_expl,
             )
 
+            print("[DEBUG] llm_expl raw:", repr(llm_expl), flush=True)
+            print("[DEBUG] base_expl raw:", repr(base_expl)[:200], flush=True)
             explanation = llm_expl or base_expl
 
             # Store both in the JSON we send to the frontend
             p["explanation"] = explanation
             if p.get("card"):
                 p["card"]["justification"] = explanation
+            print("[DEBUG] Final explanation:", explanation[:300], flush=True)
 
         except Exception as e:
             # Never break the main pipeline
