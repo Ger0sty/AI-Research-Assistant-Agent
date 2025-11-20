@@ -248,6 +248,7 @@ def _compute_paper_signals(
     q_terms: set[str],
     paper_meta: dict,
     chunks: list[dict],
+    analysis, 
     rel_threshold: float | None = None,
 ) -> PaperSignals:
     scores = [c["score"] for c in chunks if c.get("score") is not None]
@@ -272,6 +273,11 @@ def _compute_paper_signals(
     venue_boost = 0.15 if any(v in venue for v in ["acl","neurips","iclr","icml","emnlp","naacl","cvpr","eccv"]) else 0.0
     year = paper_meta.get("year")
     recency_boost = 0.1 if (isinstance(year, int) and year >= 2022) else 0.0
+    pref = analysis.get("recency") if isinstance(analysis, dict) else None
+    if pref == "recent":
+        recency_boost = 0.2 if year >= 2023 else 0
+    elif pref == "early":
+        recency_boost = 0.2 if year <= 2018 else 0
 
     return PaperSignals(
         max_score=max_score, mean_score=mean_score, coverage=coverage,
@@ -389,6 +395,19 @@ def _grade_relevance(signals: PaperSignals, meta: dict, analysis: dict) -> tuple
     if score >= 0.75: label = "Perfectly Relevant"
     elif score >= 0.50: label = "Relevant"
     else: label = "Somewhat Relevant"
+    centr = analysis.get("centrality")
+    if centr == "first":
+        score += 0.08
+    elif centr == "last":
+        score -= 0.08
+
+    bos = analysis.get("broad_or_specific")
+    if bos == "unique-identifier":
+        score += 0.05
+    elif bos == "descriptions-or-keywords":
+        score += 0.02
+
+
     return label, score
 
 def _compose_card(meta: dict, signals: PaperSignals, analysis: dict, chunks: list[dict]) -> dict:
@@ -402,6 +421,13 @@ def _compose_card(meta: dict, signals: PaperSignals, analysis: dict, chunks: lis
 
     # tags (boolean cues → badges)
     tags = set()
+
+    bos = analysis.get("broad_or_specific")
+    if bos == "unique-identifier":
+        tags.add("Specific Query")
+    elif bos == "descriptions-or-keywords":
+        tags.add("Broad Query")
+
 
     # Focus tags from analyzer keywords intersecting with title/content
     q_keywords = [k for k in (analysis.get("keywords") or []) if isinstance(k, str)]
@@ -685,7 +711,7 @@ def _build_paper_view(q: str, hits: list[dict], analysis: dict) -> list[dict]:
         for c in chunks:
             meta.update(_extract_paper_meta_from_chunk(c))
 
-        signals = _compute_paper_signals(q_terms, meta, chunks, rel_threshold=rel_thr)
+        signals = _compute_paper_signals(q_terms, meta, chunks, analysis, rel_threshold=rel_thr)
 
         # build the Asta-style card
         card = _compose_card(meta, signals, analysis, chunks)
@@ -742,11 +768,34 @@ def _build_store() -> ElasticsearchStore:
     return _store
 
 def query_rag(q: str, k: int = 5, show_scores: bool = True) -> Dict[str, Any]:
-    # --- NEW: analyzer + refined query ---
     analysis: dict = analyze_query_llm(q)
     refined_q: str = build_refined_query(analysis) or q
     analysis["refined_query"] = refined_q
+
     filters = _build_filters(analysis)
+
+    # Create Elasticsearch client
+    es = Elasticsearch(ES_URL)
+
+    # Decide search mode based on "by_title_or_name"
+    qt = analysis.get("by_title_or_name")
+
+    bos = analysis.get("broad_or_specific")
+    if bos == "unique-identifier":
+        qt = "title"
+    elif bos == "descriptions-or-keywords":
+        qt = "name"
+
+    if qt == "title":
+        # Strong exact title search
+        raw_es = _search_specific_title(es, refined_q, filters, k)
+    elif qt == "name":
+        # Keyword / semantic style
+        raw_es = _search_broad(es, refined_q, filters, k)
+    else:
+        # Default fallback → same as your current code
+        raw_es = _search_broad(es, refined_q, filters, k)
+
 
     # lightweight Python-side filter using analyzer fields
     def _passes_filters(meta: dict) -> bool:

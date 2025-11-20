@@ -133,3 +133,119 @@ Reason: the last 3 years are 2025, 2024, and 2023
 
 {"query": "research on persona-assigned Large Language Models published in 2024"}
 {"start": 2024, "end": 2024}"""
+
+
+_recency_extraction_prompt_tmpl = """
+# Task Definition
+
+Given a query for finding papers about a specific topic, decide whether the query explicitly asks for recent papers or early papers, ignoring all other information.
+
+Do not assume recency based on absolute years.
+
+If the query asks for most recent papers, return the JSON object {"prefer": "recent"}, if the query asks for early papers, return the JSON object {"prefer": "early"}, and otherwise return {"prefer": null}.
+
+# Examples
+
+{"query": "papers that have referenced 'Attention is All You Need' recently"}
+{"prefer": "recent"}
+
+{"query": "latest papers about claim verification"}
+{"prefer": "recent"}
+
+{"query": "earlier papers on seq2seq"}
+{"prefer": "early"}
+
+{"query": "survey on multi-agent collaboration in AI and HCI"}
+{"prefer": null}
+"""  # noqa: E501
+
+_centrality_extraction_prompt_tmpl = """
+# Task Definition
+
+Given a query for finding papers about a specific topic, decide whether the query asks for central papers or less cited papers, ignoring all other information.
+
+A query asks for a central paper if it uses words like "central", "seminal", "impactful", "highly influential", "highly cited", etc.
+
+A query asks for a less cited paper if it uses words like "less cited", "lesser known", etc.
+
+If the query asks for central papers, return the JSON object {"centrality": "first"}, if the query asks for less cited papers, return the JSON object {"centrality": "last"}, otherwise return {"centrality": null}.
+
+# Examples
+
+{"query": "most important references on counterfactual data augmentation (CDA)"}
+{"centrality": "first"}
+
+{"query": "top papers in AI for Earth (environmental AI)"}
+{"centrality": "first"}
+
+{"query": "least cited papers on transformers"}
+{"centrality": "last"}
+
+{"query": "papers on LSTMs that are the least cited"}
+{"centrality": "last"}
+
+{"query": "paper on weather"}
+{"centrality": null}"""  # noqa: E501
+
+
+_broad_or_specific_query_type_prompt_tmpl = """
+# Task Definition
+
+You are given a user's query aimed at finding academic papers. Your goal is to determine the nature of the query based on the following criteria:
+
+- ** unique-identifier **: The user knows the exact paper they are looking for and provides a unique identifier (the paper title or another unique name that uniquely identifies the paper).
+
+- ** descriptions-or-keywords **: The user is searching for papers using a description, keywords, or topics. The user does not provide a unique identifier for the paper. The query may contain named entities, but they do not uniquely identify a specific paper the user is looking for.
+
+If the query is searching by unique-identifier, return the JSON object {"type": "unique-identifier"}, otherwise return {"type": "descriptions-or-keywords"}.
+
+# Examples
+
+{"query": "llm hallucinations"}
+{"type": "descriptions-or-keywords"}
+
+{"query": "the snli paper"}
+{"type": "unique-identifier"}
+
+{"query": "Attention is All You Need"}
+{"type": "unique-identifier"}
+
+{"query": "GLUE paper about the evaluation of natural language understanding systems"}
+{"type": "unique-identifier"}
+Reason: The query is looking for a unique-identifier paper by name, and provides a description for extra context
+
+{"query": "pretrained large language models"}
+{"type": "descriptions-or-keywords"}
+
+{"query": "paper showing that transformers are better than LSTMs"}
+{"type": "descriptions-or-keywords"}
+
+{"query": "the first paper that evaluated the performance of transformers on the GLUE benchmark"}
+{"type": "descriptions-or-keywords"}
+Reason: The query is looking for a specific paper, but the user does not provide a unique identifier. None of the names provided ("GLUE", "transformer") uniquely identify the paper the user is looking for.
+"""
+
+
+
+_by_title_or_name_query_type_prompt_tmpl = """
+# Task Definition
+
+Given a query for finding a specific paper, decide whether the query is looking for a paper by its title, or by some key features.
+
+If the query is looking for a paper by name, return the JSON object {"type": "title"}, otherwise return {"type": "name"}. If unsure, return {"type": "name"}.
+
+# Examples
+
+{"query": "Attention is All You Need"}
+{"type": "title"}
+
+{"query": "BioBERT: a pre-trained biomedical language representation model for biomedical text mining"}
+{"type": "title"}
+
+{"query": "the snli paper"}
+{"type": "name"}
+
+{"query": "LEGOBench dataset"}
+{"type": "name"}"""  # noqa: E501
+
+
