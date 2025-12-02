@@ -4,24 +4,36 @@ FROM python:3.12-slim
 # ---- Set working directory ----
 WORKDIR /app
 
-# ---- System deps ----
+# ---- System deps needed for HF, ES client, vector stores ----
 RUN apt-get update && apt-get install -y \
-    build-essential curl git && rm -rf /var/lib/apt/lists/*
+    build-essential \
+    git \
+    curl \
+    wget \
+    ca-certificates \
+    libffi-dev \
+    libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
 
-# ---- Copy project ----
-COPY . .
-
-# ---- Install dependencies ----
+# ---- Install Python deps first (caches better) ----
+COPY requirements.txt ./
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt
 
-# (Optional) If you don't have requirements.txt yet, you can inline packages:
-# RUN pip install langchain langchain-community langchain-huggingface \
-#     elasticsearch langchain-elasticsearch python-dotenv
+# ---- Copy source code ----
+COPY . .
 
-# ---- Environment vars ----
+# ---- Ensure entrypoint is executable ----
+RUN chmod +x scripts/entrypoint.sh
+
+# ---- Python environment ----
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH="/app:${PYTHONPATH}"
 ENV CHROMA_PATH=/app/chroma
-ENV PYTHONPATH=/app
+
+# (Optional defaults, docker-compose can override)
+ENV ES_URL=http://elasticsearch:9200
+ENV ES_INDEX=rag_docs
+
 # ---- Default command ----
-CMD ["scripts/entrypoint.sh"]
+CMD ["bash", "scripts/entrypoint.sh"]

@@ -7,18 +7,27 @@ services:
     environment:
       - discovery.type=single-node
       - xpack.security.enabled=false
-      - ES_JAVA_OPTS=-Xms1g -Xmx1g
-      - ES_TMPDIR=/tmp                # <— use a writable tmp
+      # IMPORTANT — disable file watcher (fixes your crash!)
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g -Des.filewatcher.enabled=false
+      - ES_TMPDIR=/tmp
     ports:
       - "9200:9200"
     volumes:
-      - esdata:/usr/share/elasticsearch/data   # data stays on a volume
+      - esdata:/usr/share/elasticsearch/data
     tmpfs:
-      - /tmp:uid=1000,gid=0,mode=1777          # make /tmp writable to ES user
+      - /tmp:uid=1000,gid=0,mode=1777
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 40s
+
   backend:
     build: .
     depends_on:
-      - elasticsearch
+      elasticsearch:
+        condition: service_healthy
     volumes:
       - .:/app
     environment:
@@ -26,6 +35,7 @@ services:
       - ES_INDEX=rag_docs
       - HUGGINGFACE_HUB_TOKEN=${HUGGINGFACE_HUB_TOKEN}
       - EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
+      # IMPORTANT — fixes "ModuleNotFoundError: services"
       - PYTHONPATH=/app
       - USE_LLM_EXPLAIN=1
       - MAX_EXPLAIN_PAPERS=2

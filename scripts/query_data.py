@@ -88,7 +88,7 @@ def main():
     # Prepare the DB.
     
     # Search the DB.
-    results = store.similarity_search_with_score(query_text, k=args.k)
+    results = store.similarity_search_with_relevance_scores(query_text, k=args.k)
 
     if not results:
         print("No results returned. (Empty index or path/embedding mismatch.)")

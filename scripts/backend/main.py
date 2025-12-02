@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Any
 from scripts.backend.query_reanalyzer_llm import reanalyze_query_llm
-from scripts.backend.rag_service import query_rag, wait_for_index_ready
+from scripts.backend.services.pipeline.rag_pipeline import query_rag
 from scripts.backend.query_analyzer_llm import analyze_query_llm
 from scripts.backend.llm_utils import MODEL_NAME
 import inspect, asyncio

@@ -10,10 +10,7 @@ until curl -sf "$ES_URL" >/dev/null 2>&1; do
 done
 echo "✅ Elasticsearch is up."
 
-# Indexing policy:
-# - If REBUILD=1 -> always (re)index in background
-# - Else if index exists -> skip indexing
-# - Else (no index) -> index in background
+# Indexing policy
 if [ "${REBUILD:-0}" = "1" ]; then
   echo "🔄 REBUILD=1 → indexing in background..."
   python scripts/process_db.py &
