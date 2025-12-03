@@ -126,22 +126,57 @@ function App() {
   const [results, setResults] = useState<SearchResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
+  const [currentSearchId, setCurrentSearchId] = useState<string | null>(null);
+  const [currentAbort, setCurrentAbort] = useState<AbortController | null>(null);
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    // If there was an in-flight request, cancel it first (optional but nice)
+    if (currentAbort) {
+      currentAbort.abort();
+    }
+
     setLoading(true);
     setError(null);
     setResults(null);
+
+    // Generate a search_id that both frontend and backend know
+    const searchId =
+      (window.crypto && "randomUUID" in window.crypto
+        ? (window.crypto as any).randomUUID()
+        : Math.random().toString(36).slice(2)) as string;
+
+    setCurrentSearchId(searchId);
+
+    const controller = new AbortController();
+    setCurrentAbort(controller);
+
     try {
       const res = await fetch("/api/search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ q: query, k, show_scores: showScores }),
+        body: JSON.stringify({
+          query,
+          k,
+          show_scores: showScores,
+          search_id: searchId,
+        }),
+        signal: controller.signal,
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      if (!res.ok) {
+        // If backend cancelled with 499, treat as non-fatal
+        if (res.status === 499) {
+          throw new Error("cancelled");
+        }
+        throw new Error(`HTTP ${res.status}`);
+      }
+
       const raw: any = await res.json();
+
       const isPaperArray = (x: unknown): x is Paper[] =>
         Array.isArray(x) && (x.length === 0 || typeof (x as any)[0]?.paper_id === "string");
+
       const normalizedPapers: Paper[] = isPaperArray(raw?.papers)
         ? raw.papers
         : isPaperArray(raw?.results?.papers)
@@ -149,6 +184,7 @@ function App() {
         : isPaperArray(raw?.results)
         ? raw.results
         : [];
+
       const normalized: SearchResponse = {
         query: raw?.results?.query ?? raw?.query,
         refined_query: raw?.results?.refined_query ?? raw?.refined_query,
@@ -160,14 +196,48 @@ function App() {
         analysis: raw?.analysis,
         model: raw?.model,
       };
+
       setResults(normalized);
     } catch (err: any) {
+      // Abort from AbortController
+      if (err?.name === "AbortError" || err?.message === "cancelled") {
+        console.log("Search cancelled");
+        // don't treat as error
+        setError(null);
+        return;
+      }
+
       console.error("Search failed:", err);
       setError(err?.message ?? "Search failed. Check backend logs.");
     } finally {
       setLoading(false);
+      setCurrentAbort(null);
+      setCurrentSearchId(null);
     }
   };
+
+  const handleCancel = async () => {
+    if (!loading) return;
+
+    // Cancel the fetch on the client
+    if (currentAbort) {
+      currentAbort.abort();
+    }
+
+    // Ask backend to cancel the running search
+    if (currentSearchId) {
+      try {
+        await fetch(`/api/search/${currentSearchId}/cancel`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (e) {
+        console.warn("Backend cancel failed (probably already done):", e);
+      }
+    }
+  };
+
+
 
   return (
     <div className="App">
@@ -197,10 +267,28 @@ function App() {
               padding: "10px 20px",
               fontSize: "1rem",
               borderRadius: "6px",
+              marginRight: "8px",
             }}
           >
             {loading ? "Searching…" : "Search"}
           </button>
+
+          {loading && (
+            <button
+              type="button"
+              onClick={handleCancel}
+              style={{
+                padding: "10px 16px",
+                fontSize: "0.95rem",
+                borderRadius: "6px",
+                background: "#444",
+                color: "#fff",
+                border: "1px solid #666",
+              }}
+            >
+              Cancel
+            </button>
+          )}
         </div>
 
         <div className="row" style={{ alignItems: "center", gap: "16px" }}>

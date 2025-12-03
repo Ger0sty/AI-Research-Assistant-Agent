@@ -1,4 +1,4 @@
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple
 from scripts.backend.services.retrieval.elastic_client import build_store
 from scripts.backend.services.retrieval.filters import as_author_list, hit_matches_filters
 from scripts.backend.services.retrieval.filters import build_filters
@@ -19,18 +19,32 @@ def run_vector_search(
     store = build_store()
     filters = build_filters(analysis)
 
-    # Retrieve more chunks than needed
-    chunk_limit = 10 * k
+    # Number of chunks to fetch from the vector store.
+    # We want more chunks than final papers to allow filtering/grouping.
+    # Clamp so we don't go wild.
+    fetch_k = max(k * 5, k)   # e.g. k=10 -> fetch_k=50
+    fetch_k = min(fetch_k, 500)
 
-    results: List[Tuple] = store.similarity_search_with_relevance_scores(
-        refined_query,
-        k=chunk_limit,
-        search_kwargs={"num_candidates": max(chunk_limit, k)},
-    )
+    # Call the vector store in a way that *never* directly sets num_candidates,
+    # so ES won't see an illegal (num_candidates < k) combo.
+    try:
+        # Newer LangChain vector stores usually support fetch_k
+        results: List[Tuple] = store.similarity_search_with_relevance_scores(
+            refined_query,
+            k=k,          # how many results we actually want ranked
+            fetch_k=fetch_k,  # how many candidates to consider internally
+        )
+    except TypeError:
+        # Older versions without fetch_k: just over-fetch via k itself.
+        # LangChain will choose a safe num_candidates >= k internally.
+        results: List[Tuple] = store.similarity_search_with_relevance_scores(
+            refined_query,
+            k=fetch_k,
+        )
 
     hits: List[Dict] = []
 
-    for i, (doc, score) in enumerate(results):
+    for doc, score in results:
         meta = doc.metadata or {}
         real_score = float(score)
 
