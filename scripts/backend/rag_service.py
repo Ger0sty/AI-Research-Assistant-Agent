@@ -2,7 +2,6 @@
 import os
 import re
 import time
-import json
 import math
 from collections import defaultdict
 from dataclasses import dataclass
@@ -16,16 +15,20 @@ from scripts.backend.query_analyzer_llm import (
     analyze_query_llm,
     build_refined_query,
 )
-from scripts.backend.llm_utils import cal
-l_llm_json
+from scripts.backend.llm_utils import call_llm_json
+from rank_bm25 import BM25Okapi
+import nltk
+from sentence_transformers import CrossEncoder
+
+
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
-load_dotenv(ROOT_DIR / ".env", override=False)
+load_dotenv(ROOT_DIR / ".env")
 
 ES_URL = os.getenv("ES_URL", "http://localhost:9200")
 ES_INDEX = os.getenv("ES_INDEX", "rag_docs")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-USE_LLM_EXPLAIN = os.getenv("USE_LLM_EXPLAIN", "0") == "1"
-MAX_EXPLAIN_PAPERS = int(os.getenv("MAX_EXPLAIN_PAPERS", "3"))
+
 @dataclass
 class PaperSignals:
     max_score: float
@@ -38,6 +41,15 @@ class PaperSignals:
     recency_boost: float
 
 _store = None  # cached across requests
+
+cross_encoder = None
+
+def _load_cross_encoder():
+    global cross_encoder
+    if cross_encoder is None:
+        cross_encoder = CrossEncoder("BAAI/bge-reranker-base")
+    return cross_encoder
+
 
 # build ES filters
 def _build_filters(analysis: dict) -> list[dict]:
@@ -56,6 +68,44 @@ def _build_filters(analysis: dict) -> list[dict]:
         if end: rng["lte"] = end
         filters.append({"range": {"year": rng}})
     return filters
+
+
+def _bm25_rerank(chunks: list[dict], query: str) -> dict[str, float]:
+    """
+    Return a dict mapping each chunk-id → BM25 score.
+    chunk-id = index in list.
+    """
+    tokenized_docs = []
+    for c in chunks:
+        text = (c["content"] or "").lower()
+        tokens = re.findall(r"[a-z0-9]+", text)
+        tokenized_docs.append(tokens)
+
+    bm25 = BM25Okapi(tokenized_docs)
+    q_tokens = re.findall(r"[a-z0-9]+", query.lower())
+    scores = bm25.get_scores(q_tokens)
+
+    # Return {chunk_index: bm25_score}
+    return {i: float(scores[i]) for i in range(len(chunks))}
+
+def _cross_encoder_rerank(query: str, hits: list[dict]) -> dict[int, float]:
+    """
+    Returns: {chunk_index: cross_encoder_score}
+    """
+    if not hits:
+        return {}
+    
+    ce = _load_cross_encoder()
+
+    # Build sentence pairs: (query, chunk_content)
+    pairs = [(query, h["content"]) for h in hits]
+
+    # CrossEncoder returns relevance scores
+    ce_scores = ce.predict(pairs, batch_size=8, show_progress_bar=False)
+
+
+    return {i: float(ce_scores[i]) for i in range(len(hits))}
+
 
 def _search_by_author(es, refined_q: str, filters: list[dict], k: int):
     must = [{"match": {"content": refined_q}}] if refined_q else []
@@ -96,128 +146,106 @@ def _paper_cache_key(meta: dict, refined_q: str) -> str:
     return f"{refined_q}::{pid}::{y}"
 
 def _abstract_from_chunks(chunks: list[dict], max_chars: int = 1200) -> str:
+    """Prefer any chunk that looks like an abstract; else take the top-scored text."""
+    # heuristic: if a chunk’s source/title mentions 'abstract' or it’s the first chunk
+    best = None
+    for c in sorted(chunks, key=lambda c: float(c.get("score") or 0.0), reverse=True):
+        t = (c.get("content") or "")
+        if not best:
+            best = t
+        if re.search(r"\babstract\b", (c.get("source") or "") + " " + (c.get("title") or ""), flags=re.I):
+            best = t
+            break
+    best = re.sub(r"\s+", " ", (best or "").strip())
+    return best[:max_chars]
+
+# NEW — the LLM rewriter (sync; uses your call_llm_json)
+def llm_explain_choice(meta: dict, analysis: dict, chunks: list[dict],
+                       signals: PaperSignals, refined_q: str,
+                       max_quotes: int = 2) -> dict:
     """
-    Heuristic: try to approximate the paper's abstract from the retrieved chunks.
-    - Prefer chunks whose metadata 'section' mentions 'abstract'
-    - Otherwise, take the top few chunks and squash them into ~max_chars
+    Returns:
+      {
+        "why": str,              # 2-3 sentences, concrete
+        "bullets": [str, ...],   # up to 4 crisp reasons
+        "evidence": [str, ...],  # 0-2 short quotes (<=140 chars)
+        "score_note": str        # tiny note like 'author match + recent'
+      }
     """
-    if not chunks:
-        return ""
+    key = _paper_cache_key(meta, refined_q)
+    if key in _explain_cache:
+        return _explain_cache[key]
 
-    # Prefer explicit abstract section if present
-    abstract_candidates = []
-    for c in chunks:
-        section = str(c.get("section") or "").lower()
-        if "abstract" in section:
-            abstract_candidates.append(c.get("content") or "")
+    abstract = _abstract_from_chunks(chunks, 1200)
+    short_snips = []
+    for c in sorted(chunks, key=lambda c: float(c.get("score") or 0.0), reverse=True)[:max_quotes]:
+        t = re.sub(r"\s+", " ", (c.get("content") or "").strip())
+        if t:
+            short_snips.append(t[:140])
 
-    if abstract_candidates:
-        text = " ".join(abstract_candidates)
-    else:
-        # Otherwise just concatenate top-scoring chunks
-        # (callers should already pass in the paper's evidence list)
-        text = " ".join((c.get("content") or "") for c in chunks[:3])
-
-    text = re.sub(r"\s+", " ", text).strip()
-    if len(text) > max_chars:
-        text = text[:max_chars] + "…"
-    return text
-
-
-def _llm_explain_paper(
-    user_query: str,
-    paper_meta: dict,
-    analysis: dict,
-    signals: PaperSignals,
-    chunks: list[dict],
-    base_explanation: str,
-) -> str | None:
-    """
-    Ask the local LLM for a richer natural-language explanation.
-    Returns a string or None on error.
-    """
-    # Build a compact abstract + short snippets for the prompt
-    abstract_text = _abstract_from_chunks(chunks, max_chars=900)
-
-    # Take one or two short evidence snippets
-    sorted_chunks = sorted(
-        [c for c in chunks if isinstance(c.get("score"), (int, float))],
-        key=lambda c: -c["score"],
-    ) or chunks
-    def _short(txt: str) -> str:
-        txt = re.sub(r"\s+", " ", (txt or "").strip())
-        return (txt[:220] + "…") if len(txt) > 240 else txt
-
-    evidence_snips = [_short(c.get("content", "")) for c in sorted_chunks[:2]]
-
-    payload = {
-        "user_query": user_query,
-        "analysis": analysis,
+    prompt = {
+        "task": "justify_selection",
+        "constraints": {
+            "max_chars": 600,
+            "avoid_generic": ["paper", "study", "approach", "method", "model"],
+            "require_concrete_terms": True,
+            "min_specific_reasons": 2,
+        },
+        "query": {
+            "original": analysis.get("original_query", "") or "",   # may not exist; ok
+            "refined": refined_q,
+            "authors": analysis.get("authors") or [],
+            "venues": analysis.get("venues") or [],
+            "time_range": analysis.get("time_range") or {},
+            "query_type": (analysis.get("query_type") or {}).get("type", "")
+        },
         "paper": {
-            "title": paper_meta.get("title"),
-            "authors": paper_meta.get("authors"),
-            "venue": paper_meta.get("venue"),
-            "year": paper_meta.get("year"),
-            "url": paper_meta.get("url"),
+            "title": meta.get("title"),
+            "authors": meta.get("authors") or [],
+            "venue": meta.get("venue"),
+            "year": meta.get("year"),
+            "url": meta.get("url")
         },
         "signals": {
-            "max_score": signals.max_score,
-            "mean_score": signals.mean_score,
-            "coverage": signals.coverage,
-            "over_threshold": signals.over_threshold,
-            "query_overlap_terms": signals.query_overlap_terms,
+            "overlap_terms": signals.query_overlap_terms,
             "author_matched": signals.author_matched,
             "venue_boost": signals.venue_boost,
             "recency_boost": signals.recency_boost,
+            "over_threshold": signals.over_threshold
         },
-        "abstract": abstract_text,
-        "evidence_snippets": evidence_snips,
-        "baseline_explanation": base_explanation,
+        "abstract": abstract,
+        "evidence_snippets": short_snips
     }
 
-    prompt = (
-        "You are part of a scientific paper search engine.\n"
-        "Given the user query, analysis, and one candidate paper (with abstract and evidence snippets),\n"
-        "explain in 3–6 sentences WHY this paper was selected for the query.\n"
-        "Be specific about topics, methods, datasets, and evaluation if present.\n"
-        "Avoid generic reasons like 'it is a paper' or 'it was scored highly'.\n"
-        "Do NOT invent details not supported by the abstract/snippets.\n\n"
-        "Return ONLY JSON of the form:\n"
-        "{\n"
-        '  \"why\": \"your explanation here\"\n'
-        "}\n\n"
-        f"Here is the input JSON:\n{payload}\n"
+    schema = {
+        "why": "string (2-3 sentences, concrete, < 360 chars, no filler)",
+        "bullets": ["string (max 4; each < 90 chars; specific)"],
+        "evidence": ["string (<= 2 quotes; each <= 140 chars; optional)"],
+        "score_note": "string (<= 40 chars; optional)"
+    }
+
+    # Ask the LLM for strict JSON; your wrapper should return a dict or {"error": "..."}
+    generic_words = ["paper", "study", "approach", "method", "model"]
+    resp = call_llm_json(
+        f"Return ONLY JSON matching this schema:\n{schema}\n\n"
+        f"Be specific: mention at least one concept from overlap_terms or abstract nouns. "
+        f"If author filters matched, say so. If venue/year requested and satisfied, say so. "
+        f"Avoid generic words: {generic_words}.\n\n"
+        f"INPUT:\n{prompt}",
+        max_new_tokens=256
     )
-    
-    try:
-        print(f"[DEBUG] calling LLM for paper: {paper_meta.get('title')}", flush=True)
-        result = call_llm_json(prompt, max_new_tokens=512)
-        text = None
 
-        # Primary case: JSON output
-        if isinstance(result, dict):
-            text = result.get("why") or result.get("explanation") or result.get("message")
+    # Fallback if anything goes wrong
+    if not isinstance(resp, dict) or "why" not in resp:
+        resp = {
+            "why": _compose_one_liner(meta, signals, analysis, refined_q),
+            "bullets": [],
+            "evidence": short_snips[:max_quotes],
+            "score_note": ""
+        }
 
-        # Secondary case: model returned raw string (not JSON)
-        elif isinstance(result, str):
-            text = result.strip()
-
-        # Fallback: accept stringified JSON fragments
-        elif hasattr(result, "__str__"):
-            s = str(result).strip()
-            if s and len(s) > 10:
-                text = s
-
-        if isinstance(text, str) and text.strip():
-            print("[DEBUG] Parsed LLM explanation:", text[:200], flush=True)
-            return text.strip()
-
-        print("[DEBUG] LLM returned unparseable result:", repr(result)[:400], flush=True)
-        return None
-    except Exception as e:
-        print(f"[explain_paper] LLM error: {e}", flush=True)
-        return None
-
+    _explain_cache[key] = resp
+    return resp
 
 def index_exists_with_docs(es: Elasticsearch, index: str) -> bool:
     try:
@@ -272,6 +300,7 @@ def _compute_paper_signals(
     q_terms: set[str],
     paper_meta: dict,
     chunks: list[dict],
+    analysis, 
     rel_threshold: float | None = None,
 ) -> PaperSignals:
     scores = [c["score"] for c in chunks if c.get("score") is not None]
@@ -296,6 +325,11 @@ def _compute_paper_signals(
     venue_boost = 0.15 if any(v in venue for v in ["acl","neurips","iclr","icml","emnlp","naacl","cvpr","eccv"]) else 0.0
     year = paper_meta.get("year")
     recency_boost = 0.1 if (isinstance(year, int) and year >= 2022) else 0.0
+    pref = analysis.get("recency") if isinstance(analysis, dict) else None
+    if pref == "recent":
+        recency_boost = 0.2 if year >= 2023 else 0
+    elif pref == "early":
+        recency_boost = 0.2 if year <= 2018 else 0
 
     return PaperSignals(
         max_score=max_score, mean_score=mean_score, coverage=coverage,
@@ -413,6 +447,19 @@ def _grade_relevance(signals: PaperSignals, meta: dict, analysis: dict) -> tuple
     if score >= 0.75: label = "Perfectly Relevant"
     elif score >= 0.50: label = "Relevant"
     else: label = "Somewhat Relevant"
+    centr = analysis.get("centrality")
+    if centr == "first":
+        score += 0.08
+    elif centr == "last":
+        score -= 0.08
+
+    bos = analysis.get("broad_or_specific")
+    if bos == "unique-identifier":
+        score += 0.05
+    elif bos == "descriptions-or-keywords":
+        score += 0.02
+
+
     return label, score
 
 def _compose_card(meta: dict, signals: PaperSignals, analysis: dict, chunks: list[dict]) -> dict:
@@ -426,6 +473,13 @@ def _compose_card(meta: dict, signals: PaperSignals, analysis: dict, chunks: lis
 
     # tags (boolean cues → badges)
     tags = set()
+
+    bos = analysis.get("broad_or_specific")
+    if bos == "unique-identifier":
+        tags.add("Specific Query")
+    elif bos == "descriptions-or-keywords":
+        tags.add("Broad Query")
+
 
     # Focus tags from analyzer keywords intersecting with title/content
     q_keywords = [k for k in (analysis.get("keywords") or []) if isinstance(k, str)]
@@ -701,19 +755,28 @@ def _build_paper_view(q: str, hits: list[dict], analysis: dict) -> list[dict]:
     q_terms = _norm_query_terms(q)
     by_paper = _group_hits_by_paper(hits)
     papers: list[dict] = []
-    # Derive a dynamic threshold using global top score (optional)
     global_max = max((h["score"] for h in hits if isinstance(h.get("score"), (int,float))), default=0.0)
     rel_thr = 0.8 * global_max if global_max else None
 
     for pid, chunks in by_paper.items():
-        # merge paper-level meta
         meta = {}
         for c in chunks:
             meta.update(_extract_paper_meta_from_chunk(c))
-        signals = _compute_paper_signals(q_terms, meta, chunks, rel_threshold=rel_thr)
-        card = _compose_card(meta, signals, analysis, chunks)
-        explanation = _compose_explanation(meta, analysis, signals, chunks)
 
+        signals = _compute_paper_signals(q_terms, meta, chunks, analysis, rel_threshold=rel_thr)
+
+        # build the Asta-style card
+        card = _compose_card(meta, signals, analysis, chunks)
+
+        # overwrite (or set) the one-liner justification
+        one_liner = _compose_one_liner(meta, signals, analysis, q)
+
+        # LLM justification
+        llm_just = llm_explain_choice(meta, analysis, chunks, signals, q)
+        card["justification"] = llm_just.get("why") or one_liner
+        card["bullets"] = llm_just.get("bullets", [])
+        card["evidence_quotes"] = llm_just.get("evidence", [])
+        card["score_note"] = llm_just.get("score_note", "")
 
         papers.append({
             "paper_id": pid,
@@ -723,12 +786,11 @@ def _build_paper_view(q: str, hits: list[dict], analysis: dict) -> list[dict]:
             "year": meta.get("year"),
             "url": meta.get("url"),
             "card": card,
-            "signals": vars(signals),     # handy for UI debugging / sorting
-            "evidence": chunks,           # all chunk hits for this paper
-            "explanation": explanation,
+            "explanation": card["justification"], 
+            "signals": vars(signals),
+            "evidence": chunks,
         })
 
-    # Sort papers by a composite score (you can tune this)
     def _paper_sort_key(p):
         s = p["signals"]
         return (
@@ -741,75 +803,6 @@ def _build_paper_view(q: str, hits: list[dict], analysis: dict) -> list[dict]:
         )
     papers.sort(key=_paper_sort_key, reverse=True)
     return papers
-
-def _enrich_papers_with_llm_explanations(
-    user_query: str, analysis: dict, papers: list[dict]
-) -> None:
-    print(f"[DEBUG] USE_LLM_EXPLAIN={USE_LLM_EXPLAIN}, papers={len(papers)}", flush=True)
-    """
-    Optionally upgrades per-paper explanations using the local LLM.
-    - Controlled by USE_LLM_EXPLAIN
-    - Only top MAX_EXPLAIN_PAPERS papers are enriched
-    - Always falls back to heuristic explanation on error
-    """
-    if not USE_LLM_EXPLAIN:
-        return
-
-    for idx, p in enumerate(papers):
-        if idx >= MAX_EXPLAIN_PAPERS:
-            break
-
-        try:
-            sig = p.get("signals") or {}
-            signals = PaperSignals(
-                max_score=sig.get("max_score", 0.0),
-                mean_score=sig.get("mean_score", 0.0),
-                coverage=sig.get("coverage", 0),
-                over_threshold=sig.get("over_threshold", 0),
-                query_overlap_terms=sig.get("query_overlap_terms", []),
-                author_matched=sig.get("author_matched", False),
-                venue_boost=sig.get("venue_boost", 0.0),
-                recency_boost=sig.get("recency_boost", 0.0),
-            )
-            meta = {
-                "paper_id": p.get("paper_id"),
-                "title": p.get("title"),
-                "authors": p.get("authors"),
-                "venue": p.get("venue"),
-                "year": p.get("year"),
-                "url": p.get("url"),
-            }
-            chunks = p.get("evidence") or []
-
-            # Baseline heuristic explanation
-            base_expl = p.get("explanation")
-            if not base_expl:
-                base_expl = _compose_explanation(meta, analysis, signals, chunks)
-
-            # Ask the LLM for an upgraded explanation
-            llm_expl = _llm_explain_paper(
-                user_query=user_query,
-                paper_meta=meta,
-                analysis=analysis,
-                signals=signals,
-                chunks=chunks,
-                base_explanation=base_expl,
-            )
-
-            print("[DEBUG] llm_expl raw:", repr(llm_expl), flush=True)
-            print("[DEBUG] base_expl raw:", repr(base_expl)[:200], flush=True)
-            explanation = llm_expl or base_expl
-
-            # Store both in the JSON we send to the frontend
-            p["explanation"] = explanation
-            if p.get("card"):
-                p["card"]["justification"] = explanation
-            print("[DEBUG] Final explanation:", explanation[:300], flush=True)
-
-        except Exception as e:
-            # Never break the main pipeline
-            print(f"[enrich_papers] error: {e}", flush=True)
-            continue
 
 
 def _build_store() -> ElasticsearchStore:
@@ -827,10 +820,34 @@ def _build_store() -> ElasticsearchStore:
     return _store
 
 def query_rag(q: str, k: int = 5, show_scores: bool = True) -> Dict[str, Any]:
-    # --- NEW: analyzer + refined query ---
     analysis: dict = analyze_query_llm(q)
     refined_q: str = build_refined_query(analysis) or q
+    analysis["refined_query"] = refined_q
+
     filters = _build_filters(analysis)
+
+    # Create Elasticsearch client
+    es = Elasticsearch(ES_URL)
+
+    # Decide search mode based on "by_title_or_name"
+    qt = analysis.get("by_title_or_name")
+
+    bos = analysis.get("broad_or_specific")
+    if bos == "unique-identifier":
+        qt = "title"
+    elif bos == "descriptions-or-keywords":
+        qt = "name"
+
+    if qt == "title":
+        # Strong exact title search
+        raw_es = _search_specific_title(es, refined_q, filters, k)
+    elif qt == "name":
+        # Keyword / semantic style
+        raw_es = _search_broad(es, refined_q, filters, k)
+    else:
+        # Default fallback → same as your current code
+        raw_es = _search_broad(es, refined_q, filters, k)
+
 
     # lightweight Python-side filter using analyzer fields
     def _passes_filters(meta: dict) -> bool:
@@ -901,17 +918,70 @@ def query_rag(q: str, k: int = 5, show_scores: bool = True) -> Dict[str, Any]:
         }
         hits.append(hit)
 
-    # build paper view / explanations as before
-    all_papers = _build_paper_view(refined_q, hits, analysis)
-    top_k_papers = all_papers[:k]
+    # ---------------------------------------------------------
+# STEP BM25 — Re-rank the vector hits using BM25
+# ---------------------------------------------------------
+    if hits:
+        bm25_scores = _bm25_rerank(hits, refined_q)
+        # Normalize BM25 scores
+        max_bm25 = max(bm25_scores.values()) or 1.0
 
-    # NEW: optional LLM/heuristic enrichment (currently no-op unless USE_LLM_EXPLAIN=1)
-    _enrich_papers_with_llm_explanations(q, analysis, top_k_papers)
+
+        for idx, h in enumerate(hits):
+            h["bm25"] = bm25_scores[idx]
+
+        # Combine vector score + bm25 score
+        # You can tune weights later
+        for h in hits:
+            vec = h["score"]
+            bm = h["bm25"]
+            bm_norm = bm / max_bm25
+            # weighted fusion
+            h["rerank_score"] = 0.7 * vec + 0.3 * (bm / (bm + 1e-6))  # normalize BM25
+
+        # Sort the hits again using rerank score
+        hits.sort(key=lambda x: x["rerank_score"], reverse=True)
+    
+    # ---------------------------------------------------------
+# STEP CROSS-ENCODER — Deep relevance re-rank
+# ---------------------------------------------------------
+    if hits:
+        ce_scores = _cross_encoder_rerank(refined_q, hits)
+
+        for idx, h in enumerate(hits):
+            h["cross_encoder"] = ce_scores[idx]
+
+        # FINAL SCORE FUSION
+        # vec score ~ semantic
+        # bm25 score ~ lexical
+        # ce score ~ deep joint relevance
+        # tune weights later
+        for h in hits:
+            vec = h["score"]
+            bm = h.get("bm25", 0.0)
+            ce = h["cross_encoder"]
+
+            # normalize BM25 for stability
+            bm_norm = bm / (bm + 1e-6)
+
+            h["final_score"] = (
+                0.15 * vec
+                + 0.1 * bm_norm
+                + 0.75 * ce            # cross encoder HEAVILY dominates (expected)
+            )
+
+        hits.sort(key=lambda x: x["final_score"], reverse=True)
+
+
+
+    # build paper view / explanations as before
+    all_papers = _build_paper_view(refined_q, hits, analysis)   # pass refined_q for overlap scoring
+    top_k_papers = all_papers[:k]
 
     for p in top_k_papers:
         for c in p["evidence"]:
             context_parts.append(c["content"])
-    print("DEBUG PAPERS OUT:", json.dumps(all_papers, indent=2)[:2000])
+
     return {
         "query": q,
         "refined_query": refined_q,          # << expose to FE for debugging
@@ -921,3 +991,4 @@ def query_rag(q: str, k: int = 5, show_scores: bool = True) -> Dict[str, Any]:
         "papers": top_k_papers,
         "context": "\n\n---\n\n".join(context_parts),
     }
+

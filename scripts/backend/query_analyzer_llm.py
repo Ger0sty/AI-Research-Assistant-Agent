@@ -3,24 +3,16 @@ from typing import Any, Dict, List, Optional, Literal
 import re
 from pydantic import BaseModel, Field
 from scripts.backend.llm_utils import call_llm_json
-
-PROMPT = """
-You are an expert query analyzer for a scientific paper retrieval system.
-
-Given the user's query below, extract the following fields in JSON:
-{
-  "intent": "find_papers" | "find_author_papers" | "find_survey" | "other",
-  "content": "main topic or keywords only",
-  "authors": [list of author names],
-  "venues": [list of conferences or journals],
-  "years": {"start": int or null, "end": int or null},
-  "recency": "recent" | "early" | null,
-  "centrality": "seminal" | "less_cited" | null,
-  "rationale": "brief reasoning in one sentence"
-}
-
-User query: "{query}"
-"""
+from scripts.backend.query_analyzer_prompts import (
+    _content_extraction_prompt_tmpl,
+    _author_extraction_prompt_tmpl,
+    _venue_extraction_prompt_tmpl,
+    _time_range_prompt_tmpl,
+    _recency_extraction_prompt_tmpl,
+    _centrality_extraction_prompt_tmpl,
+    _broad_or_specific_query_type_prompt_tmpl,
+    _by_title_or_name_query_type_prompt_tmpl,
+)
 
 # Models
 
@@ -29,14 +21,6 @@ class YearRange(BaseModel):
     end: Optional[int] = None
     def non_empty(self) -> bool:
         return self.start is not None or self.end is not None
-
-class ExtractedProperties(BaseModel):
-    recent_first: bool = False
-    recent_last: bool = False
-    central_first: bool = False
-    central_last: bool = False
-    specific_paper_name: Optional[str] = None
-    suitable_for_by_citing: Optional[bool] = None
 
 class QueryType(BaseModel):
     type: Literal[
@@ -47,17 +31,24 @@ class QueryType(BaseModel):
         "METADATA_ONLY_NO_AUTHOR",
         "UNKNOWN",
     ] = "UNKNOWN"
-    broad_or_specific: Literal["broad", "specific", "unknown"] = "unknown"
 
 class AnalyzerOut(BaseModel):
     original_query: str
     content: str = ""
+    refined_query: str = ""
+
     authors: List[str] = Field(default_factory=list)
     venues: List[str] = Field(default_factory=list)
     time_range: YearRange = Field(default_factory=YearRange)
-    extracted_properties: ExtractedProperties = Field(default_factory=ExtractedProperties)
+
+    recency: Optional[str] = None
+    centrality: Optional[str] = None
+    broad_or_specific: Optional[str] = None
+    by_title_or_name: Optional[str] = None
+
     query_type: QueryType = Field(default_factory=QueryType)
-    refined_query: str = ""  # final text to search
+   
+
 
 # Hueristics
 _BY_SPLIT = re.compile(r"\b(?:papers?|work|publications?)\s+by\s+", re.I)
@@ -110,54 +101,177 @@ def _heuristics(q: str) -> Dict[str, Any]:
         "time_range": yr,
     }
 
+def analyze_query_using_llm(user_q: str) -> dict:
+    """
+    Use the Eight ( 8 ) Asta-style prompt templates, but combine them into a SINGLE
+    LLM call (the way Asta actually does).
+    """
+
+    # Build a single meta-prompt
+    prompt = f"""
+# Query Analysis
+
+Below are four extraction tasks. Perform ALL of them based on the same query.
+
+## 1. CONTENT EXTRACTION
+{_content_extraction_prompt_tmpl}
+
+## 2. AUTHOR EXTRACTION
+{_author_extraction_prompt_tmpl}
+
+## 3. VENUE EXTRACTION
+{_venue_extraction_prompt_tmpl}
+
+## 4. TIME RANGE EXTRACTION
+{_time_range_prompt_tmpl}
+
+## 5. RECENCY EXTRACTION
+{_recency_extraction_prompt_tmpl} 
+
+## 6. CENTRALITY EXTRACTION
+{_centrality_extraction_prompt_tmpl}
+
+## 7. BROAD OR SPECIFIC QUERY TYPE
+{_broad_or_specific_query_type_prompt_tmpl}
+
+## 8. BY TITLE OR NAME EXTRACTION
+{_by_title_or_name_query_type_prompt_tmpl}
+
+
+# REQUIREMENTS
+- Perform all eight (8) tasks simultaneously.
+- Return a single JSON object with keys:
+  content, authors, venues, time_range, refined_query, recency, centrality, broad_or_specific, by_title_or_name
+- refined_query should be a clean search-friendly combination of:
+  (content + authors + venues)
+- Use null for missing fields.
+- Do not hallucinate authors.
+- Use the user's query for all sections.
+
+# USER QUERY
+{user_q}
+
+# RETURN FORMAT
+{{
+  "content": "...",
+  "authors": [...],
+  "venues": [...],
+  "time_range": {{"start": ..., "end": ...}},
+  "refined_query": "...",
+  "recency": "...",
+  "centrality": "...",
+  "broad_or_specific": "...",
+  "by_title_or_name": "..."
+}}
+"""
+
+    out = call_llm_json(prompt)
+
+    # Guarantee safe dictionary
+    if not isinstance(out, dict):
+        out = {}
+
+    # Normalize the model output
+    content   = out.get("content") or ""
+    authors   = out.get("authors") or []
+    venues    = out.get("venues") or []
+    tr        = out.get("time_range") or {}
+    refined   = out.get("refined_query") or content
+
+    return {
+        "original_query": user_q,
+        "content": content,
+        "authors": authors,
+        "venues": venues,
+
+        "time_range": {
+            "start": tr.get("start"),
+            "end": tr.get("end"),
+        },
+
+        # NEW AST FIELDS
+        "recency": out.get("recency"),
+        "centrality": out.get("centrality"),
+        "broad_or_specific": out.get("broad_or_specific"),
+        "by_title_or_name": out.get("by_title_or_name"),
+
+        # Always include refined query
+        "refined_query": refined.strip(),
+    }
+
 _SYSTEM = (
     "Extract structured filters for an academic paper search. "
     "Return ONLY valid JSON with keys: content (string), authors (string[]), venues (string[]), "
     "years (number[]|null), refined_query (string). "
     "Do not hallucinate authors; preserve any given names exactly."
 )
-
-def _prompt(user_q: str, hints: Dict[str, Any]) -> str:
-    return (
-        _SYSTEM
-        + "\nUser query: " + user_q
-        + "\nHints: " + str({
-            "authors": hints.get("authors", []),
-            "venues": hints.get("venues", []),
-            "time_range": hints.get("time_range").dict() if hints.get("time_range") else {},
-        })
-        + "\nReturn JSON only."
-    )
+ 
 
 def analyze_query_llm(user_q: str) -> Dict[str, Any]:
     """
-    Run hybrid analysis: heuristics first, then LLM refine, then merge.
+    Correct Asta-style hybrid query analysis:
+    1. run heuristics first (explicit signals)
+    2. run Asta-style LLM (semantic interpretation)
+    3. merge the two with strict Asta rules
     """
+
+    # STEP 1 — HEURISTICS FIRST
     hints = _heuristics(user_q)
 
-    # LLM refinement (sync wrapper returns dict)
-    llm = call_llm_json(_prompt(user_q, hints), max_new_tokens=128)
-    if not isinstance(llm, dict) or "error" in llm:
-        llm = {"content": hints["content"], "authors": [], "venues": [], "years": None, "refined_query": user_q}
+    h_content = hints["content"]
+    h_authors = hints["authors"]
+    h_venues = hints["venues"]
+    h_time = hints["time_range"]
 
-    # Merge with bias to heuristic authors
-    authors = hints["authors"] or llm.get("authors", [])
-    venues = list({*(hints.get("venues") or []), *[v for v in llm.get("venues", []) if isinstance(v, str)]})
+    # STEP 2 — LLM SECOND
+    asta = analyze_query_using_llm(user_q)
 
-    authors = [re.sub(r"\s+", " ", a).strip(" .") for a in authors if isinstance(a, str) and a.strip()]
-    venues = [v.lower() for v in venues if isinstance(v, str) and v.strip()]
+    llm_content = asta.get("content", "") or ""
+    llm_authors = asta.get("authors", [])
+    llm_venues = asta.get("venues", [])
+    llm_time = asta.get("time_range", {})
+    llm_refined = asta.get("refined_query", llm_content).strip()
 
-    # Years → YearRange
-    yr_range = hints["time_range"]
-    yrs = llm.get("years")
-    if isinstance(yrs, list) and all(isinstance(x, int) for x in yrs) and yrs:
-        yr_range = YearRange(start=min(yrs), end=max(yrs))
+    # NEW FIELDS from LLM (Asta-style)
+    llm_recency = asta.get("recency")
+    llm_centrality = asta.get("centrality")
+    llm_broad_or_specific = asta.get("broad_or_specific")
+    llm_by_title_or_name = asta.get("by_title_or_name")
 
-    # Classify query type (Asta-like)
-    qt = QueryType()
+
+    # STEP 3 — MERGE RULES (Asta-accurate)
+
+    # CONTENT → LLM wins unless empty
+    content = llm_content if llm_content else h_content
+
+    # AUTHORS → heuristics override LLM if present
+    if h_authors:
+        authors = h_authors
+    else:
+        authors = llm_authors
+
+    # VENUES → combine both
+    venues = list({
+        *(v.lower() for v in h_venues),
+        *(v.lower() for v in llm_venues),
+    })
+
+    # TIME RANGE → heuristics override explicit years
+    if h_time.start or h_time.end:
+        time_range = h_time
+    else:
+        time_range = YearRange(
+            start=llm_time.get("start"),
+            end=llm_time.get("end")
+        )
+
+    # refined_query = always LLM cleaned form
+    refined_query = llm_refined if llm_refined else content
+
+    # Query type inference
     if authors:
         qt = QueryType(type="BY_AUTHOR", broad_or_specific="broad")
-    elif venues or yr_range.non_empty():
+    elif venues or time_range.non_empty():
         qt = QueryType(type="METADATA_ONLY_NO_AUTHOR", broad_or_specific="broad")
     else:
         tokens = user_q.strip().split()
@@ -166,16 +280,23 @@ def analyze_query_llm(user_q: str) -> Dict[str, Any]:
             broad_or_specific="broad" if len(tokens) <= 4 else "specific",
         )
 
+    # Build final output
     out = AnalyzerOut(
         original_query=user_q,
-        content=llm.get("content") or hints["content"],
-        authors=[a for a in authors if isinstance(a, str) and a.strip()],
-        venues=[v for v in venues if isinstance(v, str) and v.strip()],
-        time_range=yr_range,
-        extracted_properties=ExtractedProperties(),
+        content=content,
+        authors=authors,
+        venues=venues,
+        time_range=time_range,
+
+        # NEW FIELDS from LLM
+        recency=llm_recency,
+        centrality=llm_centrality,
+        broad_or_specific=llm_broad_or_specific,
+        by_title_or_name=llm_by_title_or_name,
         query_type=qt,
-        refined_query=(llm.get("refined_query") or user_q).strip(),
+        refined_query=refined_query,
     )
+
     return out.dict()
 
 def build_refined_query(analysis: Dict[str, Any]) -> str:
