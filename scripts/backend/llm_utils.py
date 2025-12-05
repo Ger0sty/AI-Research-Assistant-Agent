@@ -4,6 +4,7 @@ import os
 import re
 import torch
 from functools import lru_cache
+from typing import List
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # Pick your LLaMA model (replace with your exact model ID)
@@ -64,19 +65,10 @@ def call_llm_json(prompt: str, max_new_tokens: int = 512, system: str = None) ->
         text = tok.decode(out[0], skip_special_tokens=True)
         print("[DEBUG] Raw LLM chat output:", text, flush=True)
 
-        # --- Extract FIRST JSON object only ---
-        i = text.find("{")
-        if i < 0:
-            return {"error": "No JSON found", "raw_output": text}
-        j = text.find("}", i)
-        if j < 0:
-            return {"error": "No closing brace", "raw_output": text}
+        data, err = _extract_json_obj(text, pick="first")
+        if err:
+            return {"error": err, "raw_output": text}
 
-        json_str = text[i:j+1]
-
-        # Clean and parse
-        json_str = json_str.replace("\n", " ").strip()
-        data = json.loads(json_str)
         print("[DEBUG] Parsed JSON:", data, flush=True)
         return data
 
@@ -123,19 +115,45 @@ def call_llm_json_last(prompt: str, max_new_tokens: int = 512, system: str = Non
         text = tok.decode(out[0], skip_special_tokens=True)
         print("[DEBUG] Raw LLM chat output:", text, flush=True)
 
-        # Find ALL { ... } objects
-        json_candidates = re.findall(r"\{.*?\}", text, flags=re.DOTALL)
+        data, err = _extract_json_obj(text, pick="last")
+        if err:
+            return {"error": err, "raw_output": text}
 
-        if not json_candidates:
-            return {"error": "No JSON object found", "raw_output": text}
-
-        # Take the LAST JSON object
-        json_str = json_candidates[-1].replace("\n", " ").strip()
-
-        data = json.loads(json_str)
         print("[DEBUG] Parsed LAST JSON:", data, flush=True)
         return data
 
     except Exception as e:
         print("[call_llm_json_last] ERROR:", e, flush=True)
         return {"error": str(e)}
+
+# --- helpers ---
+_FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
+_JSON_OBJ = re.compile(r"\{.*?\}", re.DOTALL)
+
+def _json_candidates(text: str) -> List[str]:
+    candidates: List[str] = []
+    fence = _FENCE.search(text)
+    if fence:
+        candidates.append(fence.group(1))
+    candidates.extend(_JSON_OBJ.findall(text))
+    return candidates
+
+
+def _extract_json_obj(text: str, pick: str = "first"):
+    """
+    Try to parse JSON objects from model text, handling fenced ```json blocks
+    and extra assistant tokens without throwing.
+    """
+    cand = _json_candidates(text)
+    if not cand:
+        return None, "No JSON object found"
+
+    ordered = cand if pick != "last" else list(reversed(cand))
+    last_err = None
+    for js in ordered:
+        try:
+            return json.loads(js.strip()), None
+        except Exception as e:
+            last_err = str(e)
+            continue
+    return None, f"Failed to parse JSON: {last_err or 'unknown error'}"
