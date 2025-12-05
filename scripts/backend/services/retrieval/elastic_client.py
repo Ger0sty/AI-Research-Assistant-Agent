@@ -30,6 +30,49 @@ def build_store() -> ElasticsearchStore:
         )
     return _store
 
+def knn_search_with_filters(
+    refined_query_vector,
+    fetch_k: int,
+    filters: list[dict],
+):
+    """
+    Perform a filtered KNN search using Elasticsearch directly.
+    This bypasses LangChain so we can use bool.filter queries.
+    """
+    es = get_es()
+
+    body = {
+        "size": fetch_k,
+        "query": {
+            "bool": {
+                "filter": filters,   # authors/venue/year filters
+                "must": [
+                    {
+                        "script_score": {
+                            "query": {"match_all": {}},
+                            "script": {
+                                "source": "cosineSimilarity(params.query_vector, 'embedding') + 1.0",
+                                "params": {"query_vector": refined_query_vector},
+                            },
+                        }
+                    }
+                ]
+            }
+        }
+    }
+
+    resp = es.search(index=ES_INDEX, body=body)
+    hits = resp["hits"]["hits"]
+
+    # Return in the same format your retriever expects
+    out = []
+    for h in hits:
+        score = h["_score"]
+        source = h["_source"]
+        out.append((source, score))
+
+    return out
+
 def index_exists_with_docs() -> bool:
     """
     Check whether the index exists and contains at least one document.
