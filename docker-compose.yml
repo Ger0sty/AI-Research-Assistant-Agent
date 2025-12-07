@@ -38,7 +38,7 @@ services:
       # IMPORTANT — fixes "ModuleNotFoundError: services"
       - PYTHONPATH=/app
       - USE_LLM_EXPLAIN=1
-      - MAX_EXPLAIN_PAPERS=2
+      - MAX_EXPLAIN_PAPERS=1000
     ports:
       - "8000:8000"
     command: scripts/entrypoint.sh

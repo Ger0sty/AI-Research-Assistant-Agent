@@ -81,8 +81,8 @@ def run_vector_search(
 
         real_score = float(score)
 
-        # Apply analyzer-derived rules (authors/venue/year)
-        if not hit_matches_filters(meta, filters, analysis):
+        # Apply analyzer-derived rules (authors/venue/year/required terms)
+        if not hit_matches_filters(meta, filters, analysis, doc.page_content):
             continue
 
         hits.append({

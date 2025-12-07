@@ -55,6 +55,7 @@ class AnalyzerOut(BaseModel):
     authors: List[str] = Field(default_factory=list)
     venues: List[str] = Field(default_factory=list)
     time_range: YearRange = Field(default_factory=YearRange)
+    required_terms: List[str] = Field(default_factory=list)  # free-form must-have terms
     extracted_properties: ExtractedProperties = Field(default_factory=ExtractedProperties)
     query_type: QueryType = Field(default_factory=QueryType)
     refined_query: str = ""  # final text to search
@@ -112,9 +113,11 @@ def _heuristics(q: str) -> Dict[str, Any]:
 
 _SYSTEM = (
     "Extract structured filters for an academic paper search. "
-    "Return ONLY valid JSON with keys: content (string), authors (string[]), venues (string[]), "
-    "years (number[]|null), refined_query (string). "
-    "Do not hallucinate authors; preserve any given names exactly."
+    "Return ONLY valid JSON with keys: "
+    "content (string), authors (string[]), venues (string[]), years (number[]|null), "
+    "refined_query (string), required_terms (string[] of phrases that MUST appear in relevant papers). "
+    "Do not hallucinate authors; preserve given names exactly. "
+    "required_terms should include key topical phrases from the user query (e.g., 'dataset', 'text generation')."
 )
 
 def _prompt(user_q: str, hints: Dict[str, Any]) -> str:
@@ -129,6 +132,38 @@ def _prompt(user_q: str, hints: Dict[str, Any]) -> str:
         + "\nReturn JSON only."
     )
 
+
+_STOPWORDS = {
+    "paper", "papers", "publication", "publications", "work", "works",
+    "about", "for", "with", "in", "on", "of", "the", "and", "or", "to",
+    "by", "that", "this", "these", "those", "a", "an", "find", "looking",
+    "survey", "surveys", "recent", "early", "latest", "classic", "seminal",
+}
+
+
+def _fallback_required_terms(text: str, limit: int = 4) -> List[str]:
+    """
+    Lightweight fallback extractor for required terms if the LLM does not return them.
+    Produces a few keyword tokens + bigrams from the content string.
+    """
+    tokens = [t.lower() for t in re.findall(r"[A-Za-z][A-Za-z0-9_-]+", text)]
+    tokens = [t for t in tokens if len(t) > 3 and t not in _STOPWORDS]
+    uniq: List[str] = []
+    seen = set()
+    for t in tokens:
+        if t in seen:
+            continue
+        seen.add(t)
+        uniq.append(t)
+    bigrams: List[str] = []
+    for a, b in zip(tokens, tokens[1:]):
+        phrase = f"{a} {b}"
+        if phrase not in seen:
+            bigrams.append(phrase)
+            seen.add(phrase)
+    out = (bigrams + uniq)[:limit]
+    return out
+
 def analyze_query_llm(user_q: str) -> Dict[str, Any]:
     """
     Run hybrid analysis: heuristics first, then LLM refine, then merge.
@@ -138,7 +173,14 @@ def analyze_query_llm(user_q: str) -> Dict[str, Any]:
     # LLM refinement (sync wrapper returns dict)
     llm = call_llm_json(_prompt(user_q, hints), max_new_tokens=128)
     if not isinstance(llm, dict) or "error" in llm:
-        llm = {"content": hints["content"], "authors": [], "venues": [], "years": None, "refined_query": user_q}
+        llm = {
+            "content": hints["content"],
+            "authors": [],
+            "venues": [],
+            "years": None,
+            "refined_query": user_q,
+            "required_terms": [],
+        }
 
     # Merge with bias to heuristic authors
     authors = hints["authors"] or llm.get("authors", [])
@@ -166,12 +208,18 @@ def analyze_query_llm(user_q: str) -> Dict[str, Any]:
             broad_or_specific="broad" if len(tokens) <= 4 else "specific",
         )
 
+    # Required terms (LLM-provided or fallback)
+    req_terms = [t for t in llm.get("required_terms", []) if isinstance(t, str) and t.strip()]
+    if not req_terms:
+        req_terms = _fallback_required_terms(hints.get("content", ""))
+
     out = AnalyzerOut(
         original_query=user_q,
         content=llm.get("content") or hints["content"],
         authors=[a for a in authors if isinstance(a, str) and a.strip()],
         venues=[v for v in venues if isinstance(v, str) and v.strip()],
         time_range=yr_range,
+        required_terms=[t for t in req_terms if t],
         extracted_properties=ExtractedProperties(),
         query_type=qt,
         refined_query=(llm.get("refined_query") or user_q).strip(),
@@ -188,6 +236,7 @@ def build_refined_query(analysis: Dict[str, Any]) -> str:
 
     parts = [analysis.get("content", "")]
     parts += analysis.get("authors", []) + analysis.get("venues", [])
+    parts += analysis.get("required_terms", [])
     # FIX: read YearRange from 'time_range' instead of 'years'
     yr = analysis.get("time_range") or {}
     start = yr.get("start") if isinstance(yr, dict) else None
@@ -195,3 +244,7 @@ def build_refined_query(analysis: Dict[str, Any]) -> str:
     if start or end:
         parts.append(f"year:[{start or '*'} TO {end or '*'}]")
     return " ".join(p for p in parts if p)
+    # Required terms (LLM or fallback)
+    req_terms = [t for t in llm.get("required_terms", []) if isinstance(t, str) and t.strip()]
+    if not req_terms:
+        req_terms = _fallback_required_terms(hints.get("content", ""))

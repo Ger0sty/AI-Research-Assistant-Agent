@@ -53,53 +53,126 @@ def _author_terms(authors: List[str]) -> List[str]:
         dedup.append(a)
     return dedup
 
-# build ES filters
+# -----------------------------------------------
+#  External API: build_filters()
+# -----------------------------------------------
+
 def build_filters(analysis: dict) -> list[dict]:
     """
     Build Elasticsearch DSL filters from the query-analyzer output.
+    Includes softer semantic matching & improved required-term logic.
     """
     filters: list[dict] = []
-    authors = _author_terms(analysis.get("authors") or [])
-    venues  = analysis.get("venues") or []
-    yr      = (analysis.get("time_range") or {}) if isinstance(analysis.get("time_range"), dict) else {}
 
+    # Extract analyzer signals
+    authors     = _author_terms(analysis.get("authors") or [])
+    venues      = analysis.get("venues") or []
+    yr          = analysis.get("time_range") or {}
+    req_terms   = _normalize_required_terms(analysis.get("required_terms"))
+
+    # Structured filters (unchanged logic)
     if authors:
-        filters.append({
-            "bool": {
-                "should": [
-                    {"terms": {"metadata.authors.keyword": authors}},
-                    {"terms": {"authors.keyword": authors}},
-                ],
-                "minimum_should_match": 1,
-            }
-        })
+        filters.append(_author_filter(authors))
+
     if venues:
-        normalized = [v.upper() for v in venues]
-        filters.append({
-            "bool": {
-                "should": [
-                    {"terms": {"metadata.venue.keyword": normalized}},
-                    {"terms": {"venue.keyword": normalized}},
-                ],
-                "minimum_should_match": 1,
-            }
-        })
-    start, end = yr.get("start"), yr.get("end")
-    if start or end:
-        rng = {"gte": start} if start else {}
-        if end: rng["lte"] = end
-        filters.append({
-            "bool": {
-                "should": [
-                    {"range": {"metadata.year": rng}},
-                    {"range": {"year": rng}},
-                ],
-                "minimum_should_match": 1,
-            }
-        })
+        filters.append(_venue_filter(venues))
+
+    if isinstance(yr, dict) and (yr.get("start") or yr.get("end")):
+        filters.append(_year_filter(yr))
+
+    # 💡 New robust required-terms semantic filter
+    if req_terms:
+        filters.append(_required_terms_filter(req_terms))
+
     return filters
 
-def hit_matches_filters(meta: dict, filters: List[Dict], analysis: dict) -> bool:
+def _normalize_required_terms(raw_terms) -> list[str]:
+    """
+    Cleans analyzer-required terms:
+    - keeps strings only
+    - strips whitespace
+    - removes empty items
+    """
+    if not raw_terms:
+        return []
+    return [
+        t.strip()
+        for t in raw_terms
+        if isinstance(t, str) and t.strip()
+    ]
+
+def _author_filter(authors: list[str]) -> dict:
+    return {
+        "bool": {
+            "should": [
+                {"terms": {"metadata.authors.keyword": authors}},
+                {"terms": {"authors.keyword": authors}},
+            ],
+            "minimum_should_match": 1,
+        }
+    }
+
+def _venue_filter(venues: list[str]) -> dict:
+    normalized = [v.upper() for v in venues]
+    return {
+        "bool": {
+            "should": [
+                {"terms": {"metadata.venue.keyword": normalized}},
+                {"terms": {"venue.keyword": normalized}},
+            ],
+            "minimum_should_match": 1,
+        }
+    }
+
+def _year_filter(yr: dict) -> dict:
+    rng = {}
+    if yr.get("start"):
+        rng["gte"] = yr["start"]
+    if yr.get("end"):
+        rng["lte"] = yr["end"]
+
+    return {
+        "bool": {
+            "should": [
+                {"range": {"metadata.year": rng}},
+                {"range": {"year": rng}},
+            ],
+            "minimum_should_match": 1,
+        }
+    }
+
+def _required_terms_filter(req_terms: list[str]) -> dict:
+    """
+    Soft semantic filtering:
+    - Uses multi_match with fuzziness to avoid brittle exact phrase matching.
+    - Requires ~60% term overlap (or 100% if only one term).
+    """
+    # require majority of terms (not just 1)
+    minimum_should_match = (
+        "60%" if len(req_terms) > 1 else "100%"
+    )
+
+    should_clauses = []
+    for term in req_terms:
+        # softer lexical match
+        should_clauses.append({
+            "multi_match": {
+                "query": term,
+                "fields": ["text", "content"],
+                "type": "best_fields",
+                "operator": "OR",
+                "fuzziness": "AUTO"
+            }
+        })
+
+    return {
+        "bool": {
+            "should": should_clauses,
+            "minimum_should_match": minimum_should_match
+        }
+    }
+
+def hit_matches_filters(meta: dict, filters: List[Dict], analysis: dict, content: str) -> bool:
     """
     Lightweight Python-side filter that mirrors the index DSL filter logic.
     Used AFTER vector search to discard mismatches.
@@ -108,6 +181,7 @@ def hit_matches_filters(meta: dict, filters: List[Dict], analysis: dict) -> bool
     authors = _author_terms(analysis.get("authors") or [])
     venues  = analysis.get("venues") or []
     yr      = analysis.get("time_range") or {}
+    req_terms = [t for t in (analysis.get("required_terms") or []) if isinstance(t, str) and t.strip()]
 
     # Author match
     if authors:
@@ -143,5 +217,22 @@ def hit_matches_filters(meta: dict, filters: List[Dict], analysis: dict) -> bool
             # If the user asked for a year range but there is no year, reject.
             if yr.get("start") or yr.get("end"):
                 return False
+
+    
+    # Required terms match (must satisfy same threshold as ES filter)
+    text = (content or "").lower()
+    if req_terms:
+        match_count = 0
+        for term in req_terms:
+            parts = term.lower().split()
+            if parts and all(p in text for p in parts):
+                match_count += 1
+
+        # emulate ES "minimum_should_match": "60%"
+        required = max(1, int(len(req_terms) * 0.6))
+
+        if match_count < required:
+            return False
+
 
     return True

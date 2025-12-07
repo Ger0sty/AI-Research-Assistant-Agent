@@ -4,3 +4,5 @@
 /arxiv_cscl.csv
 /arxiv_cscl.parquet
 .env
+__pycache__/
+scripts/backend/services/retrieval/__pycache__/
