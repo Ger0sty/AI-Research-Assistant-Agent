@@ -299,7 +299,16 @@ def analyze_query_llm(user_q: str) -> Dict[str, Any]:
         refined_query=refined_query,
     )
 
-    return out.dict()
+    out_dict = out.dict()
+
+    out_dict["recency_preference"] = llm_recency is not None
+    out_dict["centrality_preference"] = llm_centrality is not None
+    if llm_by_title_or_name == "title":
+        out_dict["exact_title"] = content
+
+
+
+    return out_dict
 
 def build_refined_query(analysis: Dict[str, Any]) -> str:
     """

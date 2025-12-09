@@ -46,7 +46,6 @@ Reason: Every word is essential to understand the query, and there's no metadata
 {"query": "latest research on using annotation disagreements in classification models"}
 {"content": "using annotation disagreements in classification models"}
 Reason: "latest research" is time metadata
-
 {"query": "papers from ICLR 2024"}
 {"content": ""}
 Reason: The query consists of metadata only"""

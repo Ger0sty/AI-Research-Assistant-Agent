@@ -10,7 +10,6 @@ DATA_DIR.mkdir(exist_ok=True)
 sickle = Sickle("https://oaipmh.arxiv.org/oai")
 records = sickle.ListRecords(metadataPrefix="oai_dc", set="cs:cs:CL")
 
-
 # This block of code below is essentially used to see what was being returned by OAI
 """for i, record in enumerate(records):
     print(record.metadata.keys())
