@@ -1,5 +1,4 @@
 from rank_bm25 import BM25Okapi
-import nltk
 import re
 
 def _bm25_rerank(chunks: list[dict], query: str) -> dict[str, float]:

@@ -12,6 +12,8 @@ python-dotenv==1.0.1
 tqdm==4.66.6
 pandas==2.2.3
 pyarrow==16.1.0
+rank-bm25
+
 
 # --- Hugging Face / embeddings stack ---
 huggingface-hub==0.36.0

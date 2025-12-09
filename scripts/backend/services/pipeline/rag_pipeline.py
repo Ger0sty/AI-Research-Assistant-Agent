@@ -10,6 +10,8 @@ from scripts.backend.services.llm.explanation_llm import (
     build_paper_view,
     enrich_papers_with_llm_explanations,
 )
+from scripts.backend.services.ReRanker.bm25 import _bm25_rerank
+from scripts.backend.services.ReRanker.cross_encoder import _cross_encoder_rerank
 
 
 def query_rag(q: str, k: int = 5, show_scores: bool = True) -> Dict[str, Any]:
@@ -36,8 +38,33 @@ def query_rag(q: str, k: int = 5, show_scores: bool = True) -> Dict[str, Any]:
         show_scores=show_scores,
     )
 
+    if hits:
+        ce_scores = _cross_encoder_rerank(refined_q, hits)
+
+        for idx, h in enumerate(hits):
+            h["cross_encoder"] = ce_scores[idx]
+
+        # FINAL SCORE FUSION
+        # vec score ~ semantic
+        # bm25 score ~ lexical
+        # ce score ~ deep joint relevance
+        # tune weights later
+        for h in hits:
+            vec = h["score"]
+            ce = h["cross_encoder"]
+
+            # normalize BM25 for stability
+
+            h["final_score"] = (
+                0.25 * vec
+                + 0.75 * ce            # cross encoder HEAVILY dominates (expected)
+            )
+
+        hits.sort(key=lambda x: x["final_score"], reverse=True)
+
+
     # top passage score (for UI)
-    top_score: Optional[float] = hits[0]["score"] if hits else None
+    top_score: Optional[float] = hits[0]["final_score"] if hits else None
 
     # ---- 4. Build papers view ----
     papers = build_paper_view(refined_q, hits, analysis)
