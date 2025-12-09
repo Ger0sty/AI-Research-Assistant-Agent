@@ -96,6 +96,35 @@ class PaperSignalsModel(BaseModel):
             }
 
 
+class ChatMessage(BaseModel):
+    role: str  # "user" | "assistant"
+    content: str
+
+
+class Card(BaseModel):
+    verdict: Optional[str] = None
+    score: Optional[float] = None
+    justification: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
+    facts: List[str] = Field(default_factory=list)
+    url: Optional[str] = None
+    bullets: List[str] = Field(default_factory=list)
+    evidence_quotes: List[str] = Field(default_factory=list)
+    score_note: Optional[str] = None
+
+    if _HAS_NP:
+        class Config:
+            json_encoders = {
+                np.float32: float,
+                np.float64: float,
+                np.int32: int,
+                np.int64: int,
+                np.bool_: bool,
+                np.ndarray: lambda a: a.tolist(),
+                set: list,
+            }
+
+
 class Paper(BaseModel):
     paper_id: Optional[str] = None
     title: Optional[str] = None
@@ -104,6 +133,7 @@ class Paper(BaseModel):
     year: Optional[int] = None
     url: Optional[str] = None
     explanation: Optional[str] = None
+    card: Optional[Card] = None
     signals: PaperSignalsModel
     # FIX: typo in Field keyword
     evidence: List[Hit] = Field(default_factory=list)
@@ -123,6 +153,7 @@ class Paper(BaseModel):
 
 class SearchResponse(BaseModel):
     query: str
+    refined_query: Optional[str] = None
     top_score: Optional[float] = None
     hits: List[Hit] = Field(default_factory=list)
     papers: List[Paper] = Field(default_factory=list)
@@ -145,6 +176,7 @@ class SearchEnvelope(BaseModel):
     analysis: Any = None
     results: SearchResponse
     model: str
+    reply_text: Optional[str] = None
 # -----------------------------------------------------------------
 
 
@@ -160,6 +192,7 @@ class SearchRequest(BaseModel):
     k: int = Field(5, ge=1, le=100)
     search_id: Optional[str] = None
     show_scores: bool = True
+    history: List[ChatMessage] = Field(default_factory=list)
 
     def ensure_search_id(self) -> str:
         if self.search_id:
@@ -203,10 +236,26 @@ async def _run_search_impl(req: "SearchRequest") -> SearchEnvelope:
         else SearchResponse.parse_obj(raw_results)
     )
 
+    reply_bits: List[str] = []
+    reply_bits.append(f"Here are {len(results.papers)} papers for “{req.query}”.")
+    if results.refined_query and results.refined_query != req.query:
+        reply_bits.append(f"Refined query: “{results.refined_query}”.")
+    if analysis.get("authors"):
+        reply_bits.append(f"Author filter: {', '.join(analysis.get('authors', []))}.")
+    if analysis.get("venues"):
+        reply_bits.append(f"Venue filter: {', '.join(analysis.get('venues', []))}.")
+    yr = analysis.get("time_range") or {}
+    start, end = (yr.get("start"), yr.get("end")) if isinstance(yr, dict) else (None, None)
+    if start or end:
+        reply_bits.append(f"Year window: {start or 'any'}–{end or 'any'}.")
+    reply_bits.append("Follow up with another question or refine your ask.")
+    reply_text = " ".join(reply_bits)
+
     return SearchEnvelope(
         analysis=analysis,
         results=results,
         model=MODEL_NAME,
+        reply_text=reply_text,
     )
 
 # Optional: lightweight health checks

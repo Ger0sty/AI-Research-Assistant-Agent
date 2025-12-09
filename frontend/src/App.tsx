@@ -1,22 +1,13 @@
-import React, { useState } from "react"; // <-- import React for React.FC typing
+import React, { useState } from "react";
 import "./App.css";
 
-type Hit = {
-  content: string;
-  score: number | null;
-  source?: string;
-  row?: number;
-  start_index?: number;
-};
-
 type Card = {
-  verdict: string;       // "Perfectly Relevant" | "Relevant" | "Somewhat Relevant"
-  score: number;         // 0..1
-  justification: string; // one tidy sentence
-  tags: string[];        // badges
-  facts: string[];       // 0–2 short factual sentences
+  verdict?: string;
+  score?: number;
+  justification?: string;
+  tags?: string[];
+  facts?: string[];
   url?: string | null;
-
   bullets?: string[];
   evidence_quotes?: string[];
   score_note?: string;
@@ -24,7 +15,7 @@ type Card = {
 
 type EvidenceChunk = {
   content: string;
-  display_score: number | null;
+  display_score?: number | null;
   score: number;
   source?: string;
   row?: number;
@@ -49,24 +40,10 @@ type Paper = {
   venue?: string | null;
   year?: number | null;
   url?: string | null;
-
-  // NEW preferred block
   card?: Card;
-
-  // Fallbacks
   explanation?: string;
   evidence?: EvidenceChunk[];
-
-  signals: {
-    max_score: number;
-    mean_score: number;
-    coverage: number;
-    over_threshold: number;
-    query_overlap_terms: string[];
-    author_matched: boolean;
-    venue_boost: number;
-    recency_boost: number;
-  };
+  signals: PaperSignals;
 };
 
 type SearchResponse = {
@@ -75,28 +52,23 @@ type SearchResponse = {
   top_score?: number | null;
   context?: string;
   papers: Paper[];
-  hits?: Hit[];
+  hits?: any[];
   results?: unknown;
   analysis?: any;
   model?: string;
+  reply_text?: string;
 };
 
-const Tag: React.FC<{ children: React.ReactNode }> = ({ children }) => (
-  <span
-    style={{
-      display: "inline-block",
-      padding: "2px 8px",
-      borderRadius: 8,
-      background: "rgba(16,185,129,0.2)", // emerald-ish
-      color: "rgb(167,243,208)",
-      fontSize: 12,
-      marginRight: 6,
-      marginTop: 6,
-    }}
-  >
-    {children}
-  </span>
-);
+type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  papers?: Paper[];
+  analysis?: any;
+  refined_query?: string;
+  model?: string;
+  loading?: boolean;
+};
 
 const VerdictBand: React.FC<{
   label: string;
@@ -119,33 +91,151 @@ const VerdictBand: React.FC<{
   );
 };
 
+const renderPaperCard = (p: Paper, showScores: boolean) => {
+  const tone =
+    p.card?.verdict === "Perfectly Relevant"
+      ? "perfect"
+      : p.card?.verdict === "Somewhat Relevant"
+      ? "some"
+      : "relevant";
+
+  return (
+    <div key={p.paper_id} className="paper-card">
+      <h3>
+        {p.url ? (
+          <a href={p.url} target="_blank" rel="noreferrer">
+            {p.title ?? "Untitled paper"}
+          </a>
+        ) : (
+          p.title ?? "Untitled paper"
+        )}
+      </h3>
+
+      <div className="meta">
+        {p.authors?.length ? <span>{p.authors.join(", ")}</span> : null}
+        {(p.venue || p.year) && (
+          <span>
+            {p.venue ? p.venue : ""}
+            {p.venue && p.year ? " · " : ""}
+            {p.year ?? ""}
+          </span>
+        )}
+      </div>
+
+      {p.card ? (
+        <>
+          {p.card.verdict && p.card.justification && (
+            <VerdictBand label={p.card.verdict} text={p.card.justification} tone={tone} />
+          )}
+          {!p.card.verdict && p.card.justification && (
+            <p style={{ marginTop: "0.5rem", marginBottom: "0.75rem", lineHeight: 1.5 }}>
+              {p.card.justification}
+            </p>
+          )}
+
+          {p.card?.bullets && p.card.bullets.length > 0 && (
+            <ul style={{ marginTop: "0.35rem", marginLeft: "1.25rem" }}>
+              {p.card.bullets.map((b, i) => (
+                <li key={i}>{b}</li>
+              ))}
+            </ul>
+          )}
+
+          {p.card?.evidence_quotes && p.card.evidence_quotes.length > 0 && (
+            <>
+              <div style={{ marginTop: "0.35rem", fontSize: "0.9rem", opacity: 0.85 }}>LLM-picked evidence</div>
+              <ul style={{ marginTop: "0.15rem", marginLeft: "1.25rem" }}>
+                {p.card.evidence_quotes.map((q, i) => (
+                  <li key={i}>“{q}”</li>
+                ))}
+              </ul>
+            </>
+          )}
+
+          {p.card?.score_note && (
+            <div style={{ marginTop: 8, fontSize: 12, opacity: 0.6 }}>
+              Note: {p.card.score_note}
+            </div>
+          )}
+
+          {!!p.card.facts?.length && (
+            <details style={{ marginTop: 8 }}>
+              <summary>Show Evidence</summary>
+              <ul style={{ marginTop: 6, opacity: 0.9 }}>
+                {p.card.facts.map((f, i) => (
+                  <li key={i}>{f}</li>
+                ))}
+              </ul>
+            </details>
+          )}
+        </>
+      ) : (
+        <>
+          {p.explanation && <p className="why">{p.explanation}</p>}
+          {p.evidence && p.evidence.length > 0 && (
+            <details>
+              <summary>Evidence</summary>
+              <ul>
+                {p.evidence.slice(0, 2).map((chunk, i) => (
+                  <li key={i}>
+                    “
+                    {chunk.content.length > 220 ? chunk.content.slice(0, 220) + "…" : chunk.content}
+                    ”
+                    {showScores && chunk.display_score != null && (
+                      <small>
+                        {" "}
+                        (score {chunk.display_score.toFixed(3)})
+                      </small>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+        </>
+      )}
+    </div>
+  );
+};
+
 function App() {
   const [query, setQuery] = useState("");
+  const [messages, setMessages] = useState<ChatMessage[]>([
+    {
+      id: "welcome",
+      role: "assistant",
+      text: "Hi! I’m an Asta-inspired paper finder. Ask a research question to start, then follow up with clarifications or new angles.",
+    },
+  ]);
   const [k, setK] = useState<number>(5);
   const [showScores, setShowScores] = useState(true);
-  const [results, setResults] = useState<SearchResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [currentSearchId, setCurrentSearchId] = useState<string | null>(null);
   const [currentAbort, setCurrentAbort] = useState<AbortController | null>(null);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    const trimmed = query.trim();
+    if (!trimmed) return;
 
-    // If there was an in-flight request, cancel it first (optional but nice)
     if (currentAbort) {
       currentAbort.abort();
     }
 
-    setLoading(true);
-    setError(null);
-    setResults(null);
-
-    // Generate a search_id that both frontend and backend know
     const searchId =
       (window.crypto && "randomUUID" in window.crypto
         ? (window.crypto as any).randomUUID()
         : Math.random().toString(36).slice(2)) as string;
 
+    const userMsg: ChatMessage = { id: `user-${searchId}`, role: "user", text: trimmed };
+    const pendingMsg: ChatMessage = { id: `asst-${searchId}`, role: "assistant", text: "Thinking…", loading: true };
+    const historyPayload = [...messages, userMsg].map((m) => ({ role: m.role, content: m.text }));
+
+    setMessages((prev) => [...prev, userMsg, pendingMsg]);
+    setQuery("");
+    setError(null);
+    setLoading(true);
     setCurrentSearchId(searchId);
 
     const controller = new AbortController();
@@ -156,16 +246,16 @@ function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          query,
+          query: trimmed,
           k,
           show_scores: showScores,
           search_id: searchId,
+          history: historyPayload,
         }),
         signal: controller.signal,
       });
 
       if (!res.ok) {
-        // If backend cancelled with 499, treat as non-fatal
         if (res.status === 499) {
           throw new Error("cancelled");
         }
@@ -193,21 +283,36 @@ function App() {
         papers: normalizedPapers,
         hits: raw?.results?.hits ?? raw?.hits,
         results: raw?.results ?? raw,
-        analysis: raw?.analysis,
+        analysis: raw?.analysis ?? raw?.results?.analysis,
         model: raw?.model,
+        reply_text: raw?.reply_text ?? raw?.results?.reply_text,
       };
 
-      setResults(normalized);
+      const replyText =
+        normalized.reply_text ||
+        `Here are ${normalizedPapers.length || "some"} papers for “${normalized.query ?? trimmed}”.`;
+
+      const assistantMsg: ChatMessage = {
+        id: pendingMsg.id,
+        role: "assistant",
+        text: replyText,
+        papers: normalizedPapers,
+        analysis: normalized.analysis,
+        refined_query: normalized.refined_query,
+        model: normalized.model,
+        loading: false,
+      };
+
+      setMessages((prev) => prev.map((m) => (m.id === pendingMsg.id ? assistantMsg : m)));
     } catch (err: any) {
-      // Abort from AbortController
       if (err?.name === "AbortError" || err?.message === "cancelled") {
         console.log("Search cancelled");
-        // don't treat as error
+        setMessages((prev) => prev.filter((m) => !m.loading));
         setError(null);
         return;
       }
-
       console.error("Search failed:", err);
+      setMessages((prev) => prev.filter((m) => !m.loading));
       setError(err?.message ?? "Search failed. Check backend logs.");
     } finally {
       setLoading(false);
@@ -219,12 +324,10 @@ function App() {
   const handleCancel = async () => {
     if (!loading) return;
 
-    // Cancel the fetch on the client
     if (currentAbort) {
       currentAbort.abort();
     }
 
-    // Ask backend to cancel the running search
     if (currentSearchId) {
       try {
         await fetch(`/api/search/${currentSearchId}/cancel`, {
@@ -235,63 +338,19 @@ function App() {
         console.warn("Backend cancel failed (probably already done):", e);
       }
     }
+
+    setMessages((prev) => prev.filter((m) => !m.loading));
+    setLoading(false);
   };
 
-
-
   return (
-    <div className="App">
-      <h1>Paper Finder</h1>
-
-      <form onSubmit={handleSubmit} className="controls">
-        <div className="row" style={{ marginBottom: 10 }}>
-          <input
-            type="text"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search for papers…"
-            aria-label="Search query"
-            style={{
-              width: "480px",
-              padding: "10px",
-              fontSize: "1rem",
-              marginRight: "10px",
-              borderRadius: "6px",
-              border: "1px solid #ccc",
-            }}
-          />
-          <button
-            type="submit"
-            disabled={loading}
-            style={{
-              padding: "10px 20px",
-              fontSize: "1rem",
-              borderRadius: "6px",
-              marginRight: "8px",
-            }}
-          >
-            {loading ? "Searching…" : "Search"}
-          </button>
-
-          {loading && (
-            <button
-              type="button"
-              onClick={handleCancel}
-              style={{
-                padding: "10px 16px",
-                fontSize: "0.95rem",
-                borderRadius: "6px",
-                background: "#444",
-                color: "#fff",
-                border: "1px solid #666",
-              }}
-            >
-              Cancel
-            </button>
-          )}
+    <div className="App" style={{ maxWidth: 1100, margin: "0 auto", padding: "24px 18px" }}>
+      <header style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 16 }}>
+        <div>
+          <h1 style={{ margin: 0 }}>Paper Finder</h1>
+          <div style={{ opacity: 0.75 }}>Asta-style conversational search</div>
         </div>
-
-        <div className="row" style={{ alignItems: "center", gap: "16px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap", justifyContent: "flex-end" }}>
           <label htmlFor="k-range">
             Papers: <strong>{k}</strong>
           </label>
@@ -304,13 +363,9 @@ function App() {
             value={k}
             onChange={(e) => setK(parseInt(e.target.value, 10))}
             aria-label="Number of papers"
-            style={{ width: "240px" }}
+            style={{ width: "180px" }}
           />
-
-          <label
-            htmlFor="show-scores"
-            style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}
-          >
+          <label htmlFor="show-scores" style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
             <input
               id="show-scores"
               type="checkbox"
@@ -319,151 +374,125 @@ function App() {
             />
             Show scores
           </label>
+          {loading && (
+            <button
+              type="button"
+              onClick={handleCancel}
+              style={{
+                padding: "8px 12px",
+                borderRadius: 8,
+                background: "#333",
+                color: "#fff",
+                border: "1px solid #555",
+              }}
+            >
+              Cancel
+            </button>
+          )}
         </div>
-      </form>
-
-      {results?.model && (
-        <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
-          Model: <code>{results.model}</code>
-        </div>
-      )}
-      {results?.refined_query && results.refined_query !== results.query && (
-        <div style={{ marginTop: 10, opacity: 0.7, fontSize: 12 }}>
-          Refined query: <code>{results.refined_query}</code>
-        </div>
-      )}
-      {!!results?.analysis && (
-        <details style={{ marginTop: 10 }}>
-          <summary>Analyzer output</summary>
-          <pre style={{ whiteSpace: "pre-wrap" }}>
-            {JSON.stringify(results.analysis, null, 2)}
-          </pre>
-        </details>
-      )}
+      </header>
 
       {error && <div style={{ marginTop: 12, color: "#f66" }}>{error}</div>}
 
-      {/* Results */}
-      {results?.papers?.length ? (
-        <div className="results" style={{ marginTop: 20 }}>
-          {results.papers.map((p) => {
-            const tone =
-              p.card?.verdict === "Perfectly Relevant"
-                ? "perfect"
-                : p.card?.verdict === "Somewhat Relevant"
-                ? "some"
-                : "relevant";
-
-            return (
-              <div key={p.paper_id} className="paper-card">
-                <h3>
-                  {p.url ? (
-                    <a href={p.url} target="_blank" rel="noreferrer">
-                      {p.title ?? "Untitled paper"}
-                    </a>
-                  ) : (
-                    p.title ?? "Untitled paper"
-                  )}
-                </h3>
-
-                <div className="meta">
-                  {p.authors?.length ? <span>{p.authors.join(", ")}</span> : null}
-                  {(p.venue || p.year) && (
-                    <span>
-                      {p.venue ? p.venue : ""}
-                      {p.venue && p.year ? " · " : ""}
-                      {p.year ?? ""}
-                    </span>
-                  )}
-                </div>
-
-                {/* Preferred Asta-style card */}
-                {p.card ? (
-                  <>
-                    {p.card.tags?.length ? (
-                      <div style={{ marginBottom: "0.35rem", display: "flex", flexWrap: "wrap", gap: "0.35rem" }}>
-                        {p.card.tags.map((t) => (
-                          <Tag key={t}>{t}</Tag>
-                        ))}
-                      </div>
-                    ) : null}
-                    {p.card.justification && (
-                      <p style={{ marginTop: "0.5rem", marginBottom: "0.75rem", lineHeight: 1.5 }}>
-                        {p.card.justification}
-                      </p>
-                    )}
-                    {/* LLM bullet list */}
-                    {p.card?.bullets && p.card.bullets.length > 0 && (
-                      <ul style={{ marginTop: "0.35rem", marginLeft: "1.25rem" }}>
-                        {p.card.bullets.map((b, i) => (
-                          <li key={i}>{b}</li>
-                        ))}
-                      </ul>
-                    )}
-
-                    {/* LLM short quotes */}
-                    {p.card?.evidence_quotes && p.card.evidence_quotes.length > 0 && (
-                      <>
-                        <div style={{ marginTop: "0.35rem", fontSize: "0.9rem", opacity: 0.85 }}>LLM-picked evidence</div>
-                        <ul style={{ marginTop: "0.15rem", marginLeft: "1.25rem" }}>
-                          {p.card.evidence_quotes.map((q, i) => (
-                            <li key={i}>“{q}”</li>
-                          ))}
-                        </ul>
-                      </>
-                    )}
-
-                    {/* optional score note */}
-                    {p.card?.score_note && (
-                      <div style={{ marginTop: 8, fontSize: 12, opacity: 0.6 }}>
-                        Note: {p.card.score_note}
-                      </div>
-                    )}
-
-                    {!!p.card.facts?.length && (
-                      <details style={{ marginTop: 8 }}>
-                        <summary>Show Evidence</summary>
-                        <ul style={{ marginTop: 6, opacity: 0.9 }}>
-                          {p.card.facts.map((f, i) => (
-                            <li key={i}>{f}</li>
-                          ))}
-                        </ul>
-                      </details>
-                    )}
-                  </>
-                ) : (
-                  // Fallback to old fields if card not present
-                  <>
-                    {p.explanation && <p className="why">{p.explanation}</p>}
-                    {p.evidence && p.evidence.length > 0 && (
-                      <details>
-                        <summary>Evidence</summary>
-                        <ul>
-                          {p.evidence.slice(0, 2).map((chunk, i) => (
-                            <li key={i}>
-                              “
-                              {chunk.content.length > 220
-                                ? chunk.content.slice(0, 220) + "…"
-                                : chunk.content}
-                              ”
-                              {showScores && chunk.display_score != null && (
-                                <small>
-                                  {" "}
-                                  (score {chunk.display_score.toFixed(3)})
-                                </small>
-                              )}
-                            </li>
-                          ))}
-                        </ul>
-                      </details>
-                    )}
-                  </>
-                )}
+      <div
+        className="chat-window"
+        style={{
+          marginTop: 18,
+          border: "1px solid rgba(255,255,255,0.08)",
+          borderRadius: 14,
+          padding: "16px 14px",
+          background: "rgba(255,255,255,0.02)",
+          minHeight: "65vh",
+          display: "flex",
+          flexDirection: "column",
+          gap: 14,
+        }}
+      >
+        {messages.map((msg) => (
+          <div
+            key={msg.id}
+            style={{
+              display: "flex",
+              justifyContent: msg.role === "user" ? "flex-end" : "flex-start",
+            }}
+          >
+            <div
+              style={{
+                maxWidth: "82%",
+                background: msg.role === "user" ? "rgba(59,130,246,0.18)" : "rgba(255,255,255,0.04)",
+                border: "1px solid rgba(255,255,255,0.08)",
+                borderRadius: 12,
+                padding: "10px 12px",
+              }}
+            >
+              <div style={{ opacity: 0.7, fontSize: 12, marginBottom: 4 }}>
+                {msg.role === "user" ? "You" : "Assistant"}
+                {msg.model ? ` · ${msg.model}` : ""}
               </div>
-            );
-          })}
-        </div>
-      ) : null}
+              <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.45 }}>{msg.text}</div>
+              {msg.refined_query && msg.refined_query !== msg.text && (
+                <div style={{ marginTop: 8, opacity: 0.7, fontSize: 12 }}>
+                  Refined query: <code>{msg.refined_query}</code>
+                </div>
+              )}
+              {msg.analysis && (
+                <details style={{ marginTop: 10 }}>
+                  <summary>Analyzer output</summary>
+                  <pre style={{ whiteSpace: "pre-wrap" }}>{JSON.stringify(msg.analysis, null, 2)}</pre>
+                </details>
+              )}
+              {msg.papers && msg.papers.length > 0 && (
+                <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 12 }}>
+                  {msg.papers.map((p) => renderPaperCard(p, showScores))}
+                </div>
+              )}
+              {msg.loading && <div style={{ marginTop: 8, opacity: 0.6 }}>Thinking…</div>}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <form
+        onSubmit={handleSubmit}
+        style={{
+          marginTop: 16,
+          display: "flex",
+          alignItems: "flex-end",
+          gap: 10,
+        }}
+      >
+        <textarea
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Ask for papers, e.g., 'agentic AI for robotics' or follow up with refinements…"
+          aria-label="Chat input"
+          rows={2}
+          style={{
+            flex: 1,
+            padding: "10px 12px",
+            fontSize: "1rem",
+            borderRadius: 10,
+            border: "1px solid #444",
+            background: "rgba(255,255,255,0.04)",
+            color: "#fff",
+          }}
+        />
+        <button
+          type="submit"
+          disabled={loading}
+          style={{
+            padding: "12px 18px",
+            fontSize: "1rem",
+            borderRadius: 10,
+            background: loading ? "#333" : "#2563eb",
+            color: "#fff",
+            border: "none",
+            minWidth: 120,
+          }}
+        >
+          {loading ? "Searching…" : "Send"}
+        </button>
+      </form>
     </div>
   );
 }
