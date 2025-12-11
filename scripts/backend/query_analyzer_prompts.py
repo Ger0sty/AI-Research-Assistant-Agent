@@ -133,3 +133,52 @@ Reason: the last 3 years are 2025, 2024, and 2023
 
 {"query": "research on persona-assigned Large Language Models published in 2024"}
 {"start": 2024, "end": 2024}"""
+
+
+# ------------------ #
+# Recency Extraction #
+# ------------------ #
+_recency_extraction_prompt_tmpl = """
+# Task Definition
+
+Decide if the query asks for recent or early/classic papers.
+Return {"recency": "recent"} if the user wants recent or latest papers,
+{"recency": "early"} if they want older / classic work,
+otherwise {"recency": null}.
+"""
+
+
+# --------------------- #
+# Centrality Extraction #
+# --------------------- #
+_centrality_extraction_prompt_tmpl = """
+# Task Definition
+
+Decide if the query prefers seminal/highly-cited work vs. less-cited.
+Return {"centrality": "seminal"} for influential/seminal/core requests,
+{"centrality": "less_cited"} if explicitly asking for less-cited/obscure,
+otherwise {"centrality": null}.
+"""
+
+
+# ----------------------------- #
+# Broad vs Specific Query Type  #
+# ----------------------------- #
+_broad_or_specific_query_type_prompt_tmpl = """
+# Task Definition
+
+Classify the query as "broad" (general topical query) or "specific" (exact paper/title/name).
+Return {"broad_or_specific": "broad"} or {"broad_or_specific": "specific"}; use null if unclear.
+"""
+
+
+# -------------------------- #
+# By Title or Name Extraction#
+# -------------------------- #
+_by_title_or_name_query_type_prompt_tmpl = """
+# Task Definition
+
+If the query seems to mention an exact paper title, return {"by_title_or_name": "title"}.
+If it seems to mention a specific person/name to match exactly, return {"by_title_or_name": "name"}.
+Otherwise return {"by_title_or_name": null}.
+"""

@@ -6,6 +6,7 @@ langchain-community==0.3.19
 langchain-huggingface==0.3.1
 langchain-elasticsearch==0.3.2
 elasticsearch==8.15.1
+rank-bm25==0.2.2
 
 # --- Utility / I/O ---
 python-dotenv==1.0.1
