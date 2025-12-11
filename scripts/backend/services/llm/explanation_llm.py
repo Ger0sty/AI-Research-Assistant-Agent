@@ -45,6 +45,14 @@ def build_paper_view(q: str, hits: List[Dict], analysis: Dict) -> List[Dict]:
         for c in chunks:
             meta.update(extract_paper_meta_from_chunk(c))
 
+        # Derive a usable URL if missing. Many parquet rows use numeric arXiv IDs.
+        url = meta.get("url")
+        if not url and pid:
+            pid_str = str(pid).rstrip(".0")
+            # arXiv id pattern: YYYY.NNNNN (optionally with shorter suffix)
+            if re.match(r"^\\d{4}\\.\\d{4,5}(v\\d+)?$", pid_str):
+                url = f"https://arxiv.org/abs/{pid_str}"
+
         signals = compute_paper_signals(q_terms, meta, chunks, rel_threshold=rel_thr)
         card = compose_card(meta, signals, analysis, chunks)
         explanation = compose_explanation(meta, analysis, signals, chunks)
@@ -55,7 +63,7 @@ def build_paper_view(q: str, hits: List[Dict], analysis: Dict) -> List[Dict]:
             "authors": meta.get("authors"),
             "venue": meta.get("venue"),
             "year": meta.get("year"),
-            "url": meta.get("url"),
+            "url": url,
             "card": card,
             "signals": vars(signals),
             "evidence": chunks,

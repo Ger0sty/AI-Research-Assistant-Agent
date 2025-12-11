@@ -85,6 +85,10 @@ def run_vector_search(
         if not hit_matches_filters(meta, filters, analysis, doc.page_content):
             continue
 
+        pid = meta.get("paper_id")
+        if pid is not None:
+            pid = str(pid)
+
         hits.append({
             "content": doc.page_content,
             "score": real_score,
@@ -92,7 +96,7 @@ def run_vector_search(
             "source": meta.get("source"),
             "row": meta.get("row"),
             "start_index": meta.get("start_index"),
-            "paper_id": meta.get("paper_id"),
+            "paper_id": pid,
             "title": meta.get("title"),
             "authors": as_author_list(meta.get("authors")),
             "venue": meta.get("venue"),

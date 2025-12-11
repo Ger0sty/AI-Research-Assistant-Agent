@@ -1,9 +1,13 @@
 # Asta Mock Up
 
 # Running the Docker container
-In order to run the Docker container, first start the Docker app. Then, run the following command in your terminal:
+In order to run the Docker container, first start the Docker app. Then, if this is your first time running the project, run the following command in your terminal:
 ```
-docker compose down -v
+docker compose up -d elasticsearch
+REBUILD=1 python scripts/process_db.py
+```
+Then regardless of whether or not it is your first time running the project, run the following in your terminal:
+```
 docker compose up --build
 ```
 

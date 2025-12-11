@@ -1,12 +1,11 @@
 import sys
 import os
 import csv
-import shutil
+import pandas as pd
 from elasticsearch import Elasticsearch
 from langchain_elasticsearch import ElasticsearchStore
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
-from langchain_community.document_loaders import CSVLoader
 from langchain_huggingface import HuggingFaceEmbeddings
 from pathlib import Path
 from dotenv import load_dotenv
@@ -36,7 +35,17 @@ print(f"Creating new Elasticsearch index '{ES_INDEX}'...")
 
 # Point of entry
 def main():
-    documents = load_csv()
+    # Default to parquet if present, fall back to CSV to preserve old behavior.
+    parquet_path = ROOT_DIR / "data" / "database.parquet"
+    use_parquet = os.getenv("USE_PARQUET", "1") == "1"
+
+    if use_parquet and parquet_path.exists():
+        print(f"Loading data from parquet: {parquet_path}")
+        documents = load_parquet(parquet_path)
+    else:
+        if use_parquet:
+            print(f"(warning) Parquet requested but not found at {parquet_path}; falling back to CSV.")
+        documents = load_csv()
     chunks = chunk_docs(documents)
     save_to_elasticsearch(chunks)
 
@@ -53,7 +62,7 @@ def _coerce_int(x) -> int | None:
         return n
     except Exception:
         return None
-    
+
 # Loads in documents from CSV file
 def load_csv():
     try:
@@ -62,7 +71,6 @@ def load_csv():
         csv.field_size_limit(10**9)        # fallback: 1 GB
 
     csv_path = ROOT_DIR / "data" / "arxiv_nlp.csv"
-    loader = CSVLoader(file_path=str(csv_path))
     docs: list[Document] = []
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -125,6 +133,73 @@ def load_csv():
             }
 
             docs.append(Document(page_content=page_content, metadata=metadata))
+    return docs
+
+def load_parquet(parquet_path: Path | None = None) -> list[Document]:
+    """
+    Load documents from a parquet file, keeping the same field handling as the CSV path.
+    """
+    parquet_path = parquet_path or (ROOT_DIR / "data" / "database.parquet")
+    df = pd.read_parquet(parquet_path)
+    docs: list[Document] = []
+
+    for idx, row in df.iterrows():
+        rec = row.to_dict()
+        paper_id = (
+            rec.get("paper_id")
+            or rec.get("arxiv_id")
+            or rec.get("id")
+            or f"row-{idx}"
+        )
+        title = (
+            rec.get("title")
+            or rec.get("Series Name")
+            or rec.get("series name")
+            or "Untitled"
+        )
+        authors = _parse_authors(rec.get("authors") or rec.get("Authors"))
+        venue = (
+            rec.get("venue")
+            or rec.get("journal_ref")
+            or rec.get("Format")
+        )
+        year = (
+            _coerce_int(rec.get("year"))
+            or _coerce_int(rec.get("Year"))
+        )
+        url = (
+            rec.get("url")
+            or rec.get("URL")
+            or (f"https://arxiv.org/abs/{rec.get('arxiv_id')}" if rec.get("arxiv_id") else None)
+        )
+
+        abstract = rec.get("abstract") or rec.get("Abstract") or ""
+        if abstract.strip():
+            page_content = abstract.strip()
+        else:
+            parts = [
+                str(title),
+                rec.get("summary") or "",
+                rec.get("content") or "",
+                rec.get("Result") or "",
+            ]
+            page_content = "\n".join(p for p in parts if p).strip()
+            if not page_content:
+                continue
+
+        metadata = {
+            "paper_id": paper_id,
+            "title": title,
+            "authors": authors,
+            "venue": venue,
+            "year": year,
+            "url": url,
+            "source": str(parquet_path),
+            "row": idx,
+        }
+
+        docs.append(Document(page_content=page_content, metadata=metadata))
+
     return docs
 
 # Chunks a list of documents

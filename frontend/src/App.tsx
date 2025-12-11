@@ -99,11 +99,19 @@ const renderPaperCard = (p: Paper, showScores: boolean) => {
       ? "some"
       : "relevant";
 
+  // Fallback: derive arXiv URL from paper_id if backend did not supply one.
+  const arxivFromId = (pid?: string | null) => {
+    if (!pid) return null;
+    const cleaned = pid.replace(/\.0$/, "");
+    return /^\d{4}\.\d{4,5}(v\d+)?$/.test(cleaned) ? `https://arxiv.org/abs/${cleaned}` : null;
+  };
+  const href = p.url || arxivFromId(p.paper_id);
+
   return (
     <div key={p.paper_id} className="paper-card">
       <h3>
-        {p.url ? (
-          <a href={p.url} target="_blank" rel="noreferrer">
+        {href ? (
+          <a href={href} target="_blank" rel="noreferrer">
             {p.title ?? "Untitled paper"}
           </a>
         ) : (
