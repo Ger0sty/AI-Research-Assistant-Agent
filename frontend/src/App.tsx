@@ -92,7 +92,50 @@ const VerdictBand: React.FC<{
   );
 };
 
-const renderPaperCard = (p: Paper, showScores: boolean) => {
+const snippet = (text: string, maxLen = 220) =>
+  text.length > maxLen ? text.slice(0, maxLen) + "…" : text;
+
+const evidenceByRequiredTerms = (terms: string[], evidence: EvidenceChunk[], maxItems = 3) => {
+  const cleaned = (terms || []).map((t) => t.trim()).filter(Boolean);
+  if (cleaned.length === 0) {
+    return evidence.slice(0, Math.min(2, evidence.length)).map((chunk) => ({
+      term: "evidence",
+      chunk,
+    }));
+  }
+
+  const desired = cleaned.length >= 2 ? Math.min(maxItems, cleaned.length) : cleaned.length;
+  const take = cleaned.slice(0, desired);
+
+  const used = new Set<number>();
+  const mapped = take
+    .map((term) => {
+      const parts = term.toLowerCase().split(/\s+/).filter(Boolean);
+      let matchIdx = evidence.findIndex((ev, idx) => {
+        if (used.has(idx)) return false;
+        const text = (ev.content || "").toLowerCase();
+        return parts.length > 0 && parts.every((p) => text.includes(p));
+      });
+      if (matchIdx === -1) {
+        matchIdx = evidence.findIndex((_, idx) => !used.has(idx));
+      }
+      if (matchIdx === -1) return null;
+      used.add(matchIdx);
+      return { term, chunk: evidence[matchIdx] };
+    })
+    .filter(Boolean) as { term: string; chunk: EvidenceChunk }[];
+
+  if (mapped.length === 0) {
+    return evidence.slice(0, Math.min(2, evidence.length)).map((chunk) => ({
+      term: "evidence",
+      chunk,
+    }));
+  }
+
+  return mapped;
+};
+
+const renderPaperCard = (p: Paper, showScores: boolean, requiredTerms: string[]) => {
   const tone =
     p.card?.verdict === "Perfectly Relevant"
       ? "perfect"
@@ -167,16 +210,39 @@ const renderPaperCard = (p: Paper, showScores: boolean) => {
             </div>
           )}
 
-          {!!p.card.facts?.length && (
-            <details style={{ marginTop: 8 }}>
-              <summary>Show Evidence</summary>
-              <ul style={{ marginTop: 6, opacity: 0.9 }}>
-                {p.card.facts.map((f, i) => (
-                  <li key={i}>{f}</li>
-                ))}
-              </ul>
-            </details>
-          )}
+          {(() => {
+            const termEvidence = evidenceByRequiredTerms(requiredTerms, p.evidence || []);
+            if (termEvidence.length > 0) {
+              return (
+                <details style={{ marginTop: 8 }}>
+                  <summary>Show Evidence</summary>
+                  <ul style={{ marginTop: 6, opacity: 0.9 }}>
+                    {termEvidence.map(({ term, chunk }, i) => (
+                      <li key={`${term}-${i}`}>
+                        <strong>{term}:</strong> “{snippet(chunk.content || "")}”
+                        {showScores && chunk.display_score != null && (
+                          <small> (score {chunk.display_score.toFixed(3)})</small>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              );
+            }
+            if (p.card?.facts?.length) {
+              return (
+                <details style={{ marginTop: 8 }}>
+                  <summary>Show Evidence</summary>
+                  <ul style={{ marginTop: 6, opacity: 0.9 }}>
+                    {p.card.facts.map((f, i) => (
+                      <li key={i}>{f}</li>
+                    ))}
+                  </ul>
+                </details>
+              );
+            }
+            return null;
+          })()}
         </>
       ) : (
         <>
@@ -185,11 +251,9 @@ const renderPaperCard = (p: Paper, showScores: boolean) => {
             <details>
               <summary>Evidence</summary>
               <ul>
-                {p.evidence.slice(0, 2).map((chunk, i) => (
-                  <li key={i}>
-                    “
-                    {chunk.content.length > 220 ? chunk.content.slice(0, 220) + "…" : chunk.content}
-                    ”
+                {evidenceByRequiredTerms(requiredTerms, p.evidence || []).map(({ term, chunk }, i) => (
+                  <li key={`${term}-${i}`}>
+                    <strong>{term}:</strong> “{snippet(chunk.content || "")}”
                     {showScores && chunk.display_score != null && (
                       <small>
                         {" "}
@@ -463,7 +527,13 @@ function App() {
               )}
               {msg.papers && msg.papers.length > 0 && (
                 <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 12 }}>
-                  {msg.papers.map((p) => renderPaperCard(p, showScores))}
+                  {msg.papers.map((p) =>
+                    renderPaperCard(
+                      p,
+                      showScores,
+                      Array.isArray(msg.analysis?.required_terms) ? msg.analysis.required_terms : []
+                    )
+                  )}
                 </div>
               )}
               {msg.loading && <div style={{ marginTop: 8, opacity: 0.6 }}>Thinking…</div>}

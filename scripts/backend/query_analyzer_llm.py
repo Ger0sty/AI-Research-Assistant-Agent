@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Literal
 import re
 from pydantic import BaseModel, Field
-from scripts.backend.llm_utils import call_llm_json
+from scripts.backend.llm_utils import call_llm_json_last
 from scripts.backend.query_analyzer_prompts import (
     _content_extraction_prompt_tmpl,
     _author_extraction_prompt_tmpl,
@@ -200,7 +200,11 @@ Below are eight extraction tasks. Perform ALL of them based on the same query.
 }}
 """
 
-    out = call_llm_json(prompt)
+    # NOTE: the prompt includes example JSON blocks. Some smaller models tend to
+    # echo those before producing the real answer. Using the "last" parser
+    # avoids accidentally picking an example object instead of the model's
+    # final JSON.
+    out = call_llm_json_last(prompt)
     if not isinstance(out, dict):
         out = {}
 

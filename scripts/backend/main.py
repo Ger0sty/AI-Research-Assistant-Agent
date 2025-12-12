@@ -335,27 +335,18 @@ def _select_paper_indices(q: str, papers: List[Paper]) -> List[int]:
     return deduped
 
 
-def _paper_context_for_prompt(
-    papers: List[Paper],
-    idxs: List[int],
-    followup_q: str = "",
-    original_q: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+def _paper_context_for_prompt(papers: List[Paper], idxs: List[int]) -> List[Dict[str, Any]]:
     ctx: List[Dict[str, Any]] = []
     for list_pos, paper_idx in enumerate(idxs, start=1):
         if paper_idx >= len(papers):
             continue
         p = papers[paper_idx]
         ev_snips: List[str] = []
-        evidence_full: List[str] = []
-        for ch in (p.evidence or [])[:3]:
+        for ch in (p.evidence or [])[:2]:
             try:
-                txt = ch.content
+                ev_snips.append(_shorten(ch.content))
             except Exception:
-                txt = ch.get("content") if isinstance(ch, dict) else None
-            ev_snips.append(_shorten(txt))
-            if txt:
-                evidence_full.append(_shorten(txt, limit=360))
+                ev_snips.append(_shorten(ch.get("content") if isinstance(ch, dict) else None))
         ctx.append(
             {
                 "rank": paper_idx + 1,
@@ -367,9 +358,6 @@ def _paper_context_for_prompt(
                 "url": p.url,
                 "summary": (p.card.justification if p.card else None) or p.explanation,
                 "evidence": ev_snips,
-                "evidence_long": evidence_full,
-                "original_query": original_q,
-                "followup_query": followup_q,
             }
         )
     return ctx
@@ -399,21 +387,14 @@ Return JSON: {{"intent": "FOLLOWUP" | "NEW_SEARCH", "reason": "short reason"}}
     return out
 
 
-def _llm_followup_reply(
-    user_q: str,
-    paper_ctx: List[Dict[str, Any]],
-    original_q: Optional[str] = None,
-) -> Optional[str]:
+def _llm_followup_reply(user_q: str, paper_ctx: List[Dict[str, Any]]) -> Optional[str]:
     prompt = (
-        "You answer follow-up questions about previously returned papers for a research assistant.\n"
-        "Use ONLY the provided papers; do not invent new ones or add external papers.\n"
-        "Synthesize a fresh response (do NOT copy provided summaries verbatim) using evidence/snippets.\n"
-        "Address the user's request directly; include paper titles or ranks when helpful.\n"
-        "Keep it concise: 3-6 sentences, plain text.\n"
+        "You answer follow-up questions about previously returned papers.\n"
+        "Use ONLY the provided papers; do not invent new ones.\n"
+        "Keep the reply concise (3-6 sentences) and mention paper titles or ranks when relevant.\n"
         'Return JSON: {"reply": "..."}\n\n'
-        f"Original search (for context): {original_q or 'n/a'}\n"
-        f"Follow-up request: {user_q}\n"
-        f"Papers JSON: {paper_ctx}\n"
+        f"User request: {user_q}\n"
+        f"Papers: {paper_ctx}\n"
     )
     res = call_llm_json_last(prompt, max_new_tokens=512)
     if isinstance(res, dict):
@@ -437,8 +418,6 @@ def _fallback_followup_reply(paper_ctx: List[Dict[str, Any]], user_q: str) -> st
             bits.append(", ".join(p["authors"]))
         if p.get("summary"):
             bits.append(p["summary"])
-        elif p.get("evidence_long"):
-            bits.append(p["evidence_long"][0])
         elif p.get("evidence"):
             bits.append(p["evidence"][0])
         line = " — ".join(bits) if bits else f"Paper {p.get('rank')}"
@@ -468,8 +447,8 @@ async def _maybe_handle_followup(req: "SearchRequest") -> Optional[SearchEnvelop
 
     idxs = _select_paper_indices(req.query, prior.last_papers)
     chosen = [prior.last_papers[i] for i in idxs if i < len(prior.last_papers)]
-    paper_ctx = _paper_context_for_prompt(prior.last_papers, idxs, followup_q=req.query, original_q=prior.last_query)
-    reply = await call_maybe_async(_llm_followup_reply, req.query, paper_ctx, prior.last_query)
+    paper_ctx = _paper_context_for_prompt(prior.last_papers, idxs)
+    reply = await call_maybe_async(_llm_followup_reply, req.query, paper_ctx)
     if not reply:
         reply = _fallback_followup_reply(paper_ctx, req.query)
 
