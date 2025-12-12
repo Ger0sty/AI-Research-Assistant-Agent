@@ -63,6 +63,7 @@ type ChatMessage = {
   id: string;
   role: "user" | "assistant";
   text: string;
+  query?: string;
   papers?: Paper[];
   analysis?: any;
   refined_query?: string;
@@ -236,6 +237,8 @@ function App() {
         ? (window.crypto as any).randomUUID()
         : Math.random().toString(36).slice(2)) as string;
 
+    const lastAnswer = [...messages].reverse().find((m) => m.role === "assistant" && m.papers && m.papers.length);
+
     const userMsg: ChatMessage = { id: `user-${searchId}`, role: "user", text: trimmed };
     const pendingMsg: ChatMessage = { id: `asst-${searchId}`, role: "assistant", text: "Thinking…", loading: true };
     const historyPayload = [...messages, userMsg].map((m) => ({ role: m.role, content: m.text }));
@@ -259,6 +262,14 @@ function App() {
           show_scores: showScores,
           search_id: searchId,
           history: historyPayload,
+          prior_results: lastAnswer
+            ? {
+                last_query: lastAnswer.query ?? lastAnswer.text,
+                last_refined_query: lastAnswer.refined_query,
+                last_analysis: lastAnswer.analysis,
+                last_papers: lastAnswer.papers,
+              }
+            : null,
         }),
         signal: controller.signal,
       });
@@ -304,6 +315,7 @@ function App() {
         id: pendingMsg.id,
         role: "assistant",
         text: replyText,
+        query: normalized.query ?? trimmed,
         papers: normalizedPapers,
         analysis: normalized.analysis,
         refined_query: normalized.refined_query,

@@ -6,7 +6,8 @@ from typing import List, Optional, Any, Dict
 from scripts.backend.query_reanalyzer_llm import reanalyze_query_llm
 from scripts.backend.services.pipeline.rag_pipeline import query_rag
 from scripts.backend.query_analyzer_llm import analyze_query_llm
-from scripts.backend.llm_utils import MODEL_NAME
+from scripts.backend.llm_utils import MODEL_NAME, call_llm_json, call_llm_json_last
+import re
 import inspect
 import asyncio
 import uuid
@@ -186,6 +187,13 @@ class FeedbackRequest(BaseModel):
     analysis: Optional[dict] = None
 
 
+class PriorResults(BaseModel):
+    last_query: Optional[str] = None
+    last_refined_query: Optional[str] = None
+    last_analysis: Optional[dict] = None
+    last_papers: List[Paper] = Field(default_factory=list)
+
+
 class SearchRequest(BaseModel):
     # IMPORTANT: use 'query' if your frontend sends { "query": "..." }
     query: str
@@ -193,6 +201,7 @@ class SearchRequest(BaseModel):
     search_id: Optional[str] = None
     show_scores: bool = True
     history: List[ChatMessage] = Field(default_factory=list)
+    prior_results: Optional[PriorResults] = None
 
     def ensure_search_id(self) -> str:
         if self.search_id:
@@ -202,11 +211,306 @@ class SearchRequest(BaseModel):
         return self.search_id
 
 
+_FOLLOWUP_HINTS = [
+    "previous papers",
+    "those papers",
+    "these papers",
+    "that paper",
+    "second paper",
+    "third paper",
+    "first paper",
+    "paper 2",
+    "paper #2",
+    "tell me more",
+    "more info",
+    "more information",
+    "details on",
+    "the above",
+]
+
+_ORDINAL_MAP = {
+    "first": 0,
+    "second": 1,
+    "third": 2,
+    "fourth": 3,
+    "fifth": 4,
+}
+
+_AUTHOR_PHRASES = re.compile(r"\b(?:papers?|publications?|work)\s+by\s+", re.IGNORECASE)
+_NAME_TOKEN = re.compile(r"[A-Z][A-Za-z\-\.'`]+(?:\s+[A-Z][A-Za-z\-\.'`]+)+", re.IGNORECASE)
+
+
+def _shorten(txt: Optional[str], limit: int = 240) -> str:
+    if not txt:
+        return ""
+    clean = re.sub(r"\s+", " ", str(txt)).strip()
+    return clean[:limit] + ("…" if len(clean) > limit else "")
+
+
+def _looks_like_author_query(q: str) -> bool:
+    """
+    Heuristic to preserve author searches: detect 'papers by <Name>'.
+    """
+    if _AUTHOR_PHRASES.search(q):
+        return True
+    lower_q = q.lower()
+    if " by " in lower_q:
+        # detect "by Andrew Ng" even if "papers" is omitted
+        pos = lower_q.find(" by ")
+        tail = q[pos + 4 :]  # skip the " by " token
+        if _NAME_TOKEN.search(tail):
+            return True
+    return False
+
+
+def _looks_like_followup(q: str) -> bool:
+    s = q.lower()
+    if any(h in s for h in _FOLLOWUP_HINTS):
+        return True
+    if re.search(r"\b(?:first|second|third|fourth|fifth)\s+paper\b", s):
+        return True
+    num_mentions = re.findall(r"\bpaper\s*(?:#|number\s*)?(\d+)\b", s)
+    if any(m.isdigit() and int(m) <= 10 for m in num_mentions):
+        return True
+    return False
+
+
+def _indices_from_text(q: str, total: int) -> List[int]:
+    s = q.lower()
+    out: List[int] = []
+    for word, idx in _ORDINAL_MAP.items():
+        if word in s:
+            out.append(idx)
+    for m in re.findall(r"\bpaper\s*(?:#|number\s*)?(\d+)\b", s):
+        try:
+            val = int(m) - 1
+            if 0 <= val < total:
+                out.append(val)
+        except Exception:
+            continue
+    for m in re.findall(r"\b(\d+)(?:st|nd|rd|th)\b", s):
+        try:
+            val = int(m) - 1
+            if 0 <= val < total:
+                out.append(val)
+        except Exception:
+            continue
+    deduped = []
+    seen = set()
+    for i in out:
+        if 0 <= i < total and i not in seen:
+            seen.add(i)
+            deduped.append(i)
+    return deduped
+
+
+def _title_hits(q: str, papers: List[Paper]) -> List[int]:
+    s = q.lower()
+    hits: List[int] = []
+    for idx, p in enumerate(papers):
+        t = (p.title or "").lower()
+        if not t:
+            continue
+        tokens = [tok for tok in re.findall(r"[a-z0-9]{4,}", t)]
+        if tokens and any(tok in s for tok in tokens[:3]):
+            hits.append(idx)
+    return hits
+
+
+def _select_paper_indices(q: str, papers: List[Paper]) -> List[int]:
+    total = len(papers)
+    if total == 0:
+        return []
+    idxs = _indices_from_text(q, total)
+    if not idxs:
+        idxs = _title_hits(q, papers)
+    if not idxs:
+        idxs = list(range(min(3, total)))
+    deduped = []
+    seen = set()
+    for i in idxs:
+        if 0 <= i < total and i not in seen:
+            seen.add(i)
+            deduped.append(i)
+    return deduped
+
+
+def _paper_context_for_prompt(
+    papers: List[Paper],
+    idxs: List[int],
+    followup_q: str = "",
+    original_q: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    ctx: List[Dict[str, Any]] = []
+    for list_pos, paper_idx in enumerate(idxs, start=1):
+        if paper_idx >= len(papers):
+            continue
+        p = papers[paper_idx]
+        ev_snips: List[str] = []
+        evidence_full: List[str] = []
+        for ch in (p.evidence or [])[:3]:
+            try:
+                txt = ch.content
+            except Exception:
+                txt = ch.get("content") if isinstance(ch, dict) else None
+            ev_snips.append(_shorten(txt))
+            if txt:
+                evidence_full.append(_shorten(txt, limit=360))
+        ctx.append(
+            {
+                "rank": paper_idx + 1,
+                "paper_id": p.paper_id,
+                "title": p.title,
+                "authors": p.authors,
+                "venue": p.venue,
+                "year": p.year,
+                "url": p.url,
+                "summary": (p.card.justification if p.card else None) or p.explanation,
+                "evidence": ev_snips,
+                "evidence_long": evidence_full,
+                "original_query": original_q,
+                "followup_query": followup_q,
+            }
+        )
+    return ctx
+
+
+def _llm_route_followup(user_q: str, prior: PriorResults, papers: List[Paper]) -> Dict[str, Any]:
+    titles = [p.title for p in papers if p.title][:5]
+    prompt = f"""
+You route chat turns for a paper search assistant.
+Decide if the user wants a NEW_SEARCH (retrieve new papers) or FOLLOWUP (answer using the previously returned papers).
+- Pick FOLLOWUP if the question references earlier results, asks for details about them, comparisons, or clarifications.
+- Pick NEW_SEARCH if the user wants a fresh set of papers or switches topics.
+
+User message: "{user_q}"
+Previous query: "{prior.last_query or ''}"
+Previous paper titles: {titles}
+
+Return JSON: {{"intent": "FOLLOWUP" | "NEW_SEARCH", "reason": "short reason"}}
+"""
+    out = call_llm_json(prompt, max_new_tokens=256)
+    if not isinstance(out, dict):
+        return {"intent": "NEW_SEARCH", "reason": "LLM failed"}
+    intent = (out.get("intent") or "").upper()
+    if intent not in {"FOLLOWUP", "NEW_SEARCH"}:
+        intent = "NEW_SEARCH"
+    out["intent"] = intent
+    return out
+
+
+def _llm_followup_reply(
+    user_q: str,
+    paper_ctx: List[Dict[str, Any]],
+    original_q: Optional[str] = None,
+) -> Optional[str]:
+    prompt = (
+        "You answer follow-up questions about previously returned papers for a research assistant.\n"
+        "Use ONLY the provided papers; do not invent new ones or add external papers.\n"
+        "Synthesize a fresh response (do NOT copy provided summaries verbatim) using evidence/snippets.\n"
+        "Address the user's request directly; include paper titles or ranks when helpful.\n"
+        "Keep it concise: 3-6 sentences, plain text.\n"
+        'Return JSON: {"reply": "..."}\n\n'
+        f"Original search (for context): {original_q or 'n/a'}\n"
+        f"Follow-up request: {user_q}\n"
+        f"Papers JSON: {paper_ctx}\n"
+    )
+    res = call_llm_json_last(prompt, max_new_tokens=512)
+    if isinstance(res, dict):
+        reply = res.get("reply") or res.get("why")
+        if reply:
+            return str(reply).strip()
+    if isinstance(res, str) and res.strip():
+        return res.strip()
+    return None
+
+
+def _fallback_followup_reply(paper_ctx: List[Dict[str, Any]], user_q: str) -> str:
+    if not paper_ctx:
+        return f"I couldn't find previous papers to answer “{user_q}”. Please run a new search."
+    lines = ["Here’s more using the earlier results:"]
+    for p in paper_ctx:
+        bits = []
+        if p.get("title"):
+            bits.append(f"{p.get('title')} ({p.get('year') or 'year n/a'})")
+        if p.get("authors"):
+            bits.append(", ".join(p["authors"]))
+        if p.get("summary"):
+            bits.append(p["summary"])
+        elif p.get("evidence_long"):
+            bits.append(p["evidence_long"][0])
+        elif p.get("evidence"):
+            bits.append(p["evidence"][0])
+        line = " — ".join(bits) if bits else f"Paper {p.get('rank')}"
+        lines.append(f"- {line}")
+    return "\n".join(lines)
+
+
+async def _maybe_handle_followup(req: "SearchRequest") -> Optional[SearchEnvelope]:
+    prior = req.prior_results
+    if not prior or not prior.last_papers:
+        return None
+
+    # if the user is asking for papers by an author, treat as a fresh search
+    if _looks_like_author_query(req.query):
+        return None
+
+    heuristic_followup = _looks_like_followup(req.query)
+    intent_meta = {"intent": "NEW_SEARCH", "reason": "default"}
+
+    if heuristic_followup:
+        intent_meta = {"intent": "FOLLOWUP", "reason": "heuristic match"}
+    else:
+        intent_meta = await call_maybe_async(_llm_route_followup, req.query, prior, prior.last_papers)
+
+    if (intent_meta.get("intent") or "").upper() != "FOLLOWUP":
+        return None
+
+    idxs = _select_paper_indices(req.query, prior.last_papers)
+    chosen = [prior.last_papers[i] for i in idxs if i < len(prior.last_papers)]
+    paper_ctx = _paper_context_for_prompt(prior.last_papers, idxs, followup_q=req.query, original_q=prior.last_query)
+    reply = await call_maybe_async(_llm_followup_reply, req.query, paper_ctx, prior.last_query)
+    if not reply:
+        reply = _fallback_followup_reply(paper_ctx, req.query)
+
+    context_text = "\n\n---\n\n".join(
+        [c.get("summary") or "" for c in paper_ctx if c.get("summary")] or ["Used previous papers for follow-up."]
+    )
+
+    sr = SearchResponse(
+        query=prior.last_query or req.query,
+        refined_query=prior.last_refined_query or prior.last_query or req.query,
+        top_score=None,
+        hits=[],
+        papers=chosen,
+        context=context_text,
+    )
+
+    analysis_payload = {
+        "intent": "FOLLOWUP",
+        "router": intent_meta,
+        "source_analysis": prior.last_analysis,
+        "selected_indices": idxs,
+        "paper_ids": [p.paper_id for p in chosen if p.paper_id],
+    }
+
+    return SearchEnvelope(
+        analysis=analysis_payload,
+        results=sr,
+        model=MODEL_NAME,
+        reply_text=reply,
+    )
+
+
 async def _run_search_impl(req: "SearchRequest") -> SearchEnvelope:
     """
     Core search logic, extracted so it can be wrapped in a cancellable Task.
     This is basically your old /api/search body.
     """
+    followup = await _maybe_handle_followup(req)
+    if followup:
+        return followup
+
     try:
         analysis = await call_maybe_async(analyze_query_llm, req.query)
     except Exception as e:
