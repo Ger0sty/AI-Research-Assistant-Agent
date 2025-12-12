@@ -23,7 +23,12 @@ def get_model_and_tokenizer():
     mdl.to(device); mdl.eval()
     return tok, mdl
 
-def call_llm_json(prompt: str, max_new_tokens: int = 512, system: str = None) -> dict:
+def call_llm_json(
+    prompt: str,
+    max_new_tokens: int = 512,
+    system: str = None,
+    required_keys: list = None,
+) -> dict:
     """
     Calls a chat-formatted LLaMA model using apply_chat_template,
     guaranteeing that system and user messages are separated.
@@ -62,10 +67,14 @@ def call_llm_json(prompt: str, max_new_tokens: int = 512, system: str = None) ->
                 do_sample=False,
             )
 
-        text = tok.decode(out[0], skip_special_tokens=True)
+        # Only decode the assistant portion (exclude the prompt tokens) to avoid
+        # accidentally parsing JSON examples from the prompt.
+        prompt_len = inputs.shape[-1]
+        generated = out[0][prompt_len:]
+        text = tok.decode(generated, skip_special_tokens=True)
         print("[DEBUG] Raw LLM chat output:", text, flush=True)
 
-        data, err = _extract_json_obj(text, pick="first")
+        data, err = _extract_json_obj(text, pick="first", required_keys=required_keys)
         if err:
             return {"error": err, "raw_output": text}
 
@@ -76,7 +85,12 @@ def call_llm_json(prompt: str, max_new_tokens: int = 512, system: str = None) ->
         print("[call_llm_json] ERROR:", e, flush=True)
         return {"error": str(e)}
 
-def call_llm_json_last(prompt: str, max_new_tokens: int = 512, system: str = None) -> dict:
+def call_llm_json_last(
+    prompt: str,
+    max_new_tokens: int = 512,
+    system: str = None,
+    required_keys: list = None,
+) -> dict:
     """
     Same as call_llm_json, but extracts the LAST JSON object from the LLM output.
     Required for paper explanations because the model prints example JSON first.
@@ -112,10 +126,12 @@ def call_llm_json_last(prompt: str, max_new_tokens: int = 512, system: str = Non
                 do_sample=False,
             )
 
-        text = tok.decode(out[0], skip_special_tokens=True)
+        prompt_len = inputs.shape[-1]
+        generated = out[0][prompt_len:]
+        text = tok.decode(generated, skip_special_tokens=True)
         print("[DEBUG] Raw LLM chat output:", text, flush=True)
 
-        data, err = _extract_json_obj(text, pick="last")
+        data, err = _extract_json_obj(text, pick="last", required_keys=required_keys)
         if err:
             return {"error": err, "raw_output": text}
 
@@ -139,7 +155,7 @@ def _json_candidates(text: str) -> List[str]:
     return candidates
 
 
-def _extract_json_obj(text: str, pick: str = "first"):
+def _extract_json_obj(text: str, pick: str = "first", required_keys: list = None):
     """
     Try to parse JSON objects from model text, handling fenced ```json blocks
     and extra assistant tokens without throwing.
@@ -152,7 +168,12 @@ def _extract_json_obj(text: str, pick: str = "first"):
     last_err = None
     for js in ordered:
         try:
-            return json.loads(js.strip()), None
+            obj = json.loads(js.strip())
+            if required_keys:
+                if not all(k in obj for k in required_keys):
+                    last_err = f"Missing required keys {required_keys}"
+                    continue
+            return obj, None
         except Exception as e:
             last_err = str(e)
             continue

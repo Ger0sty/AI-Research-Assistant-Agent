@@ -188,15 +188,15 @@ Below are eight extraction tasks. Perform ALL of them based on the same query.
 
 # RETURN FORMAT
 {{
-  "content": "...",
-  "authors": [...],
-  "venues": [...],
-  "time_range": {{"start": ..., "end": ...}},
-  "refined_query": "...",
-  "recency": "...",
-  "centrality": "...",
-  "broad_or_specific": "...",
-  "by_title_or_name": "..."
+  "content": "",
+  "authors": [],
+  "venues": [],
+  "time_range": {{"start": null, "end": null}},
+  "refined_query": "",
+  "recency": null,
+  "centrality": null,
+  "broad_or_specific": null,
+  "by_title_or_name": null
 }}
 """
 
@@ -204,7 +204,20 @@ Below are eight extraction tasks. Perform ALL of them based on the same query.
     # echo those before producing the real answer. Using the "last" parser
     # avoids accidentally picking an example object instead of the model's
     # final JSON.
-    out = call_llm_json_last(prompt)
+    out = call_llm_json_last(
+        prompt,
+        required_keys=[
+            "content",
+            "authors",
+            "venues",
+            "time_range",
+            "refined_query",
+            "recency",
+            "centrality",
+            "broad_or_specific",
+            "by_title_or_name",
+        ],
+    )
     if not isinstance(out, dict):
         out = {}
 
