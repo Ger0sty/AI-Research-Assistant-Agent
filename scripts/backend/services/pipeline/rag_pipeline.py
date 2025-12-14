@@ -79,10 +79,12 @@ def query_rag(q: str, k: int = 5, show_scores: bool = True) -> Dict[str, Any]:
         analysis=analysis,
         papers=papers,
     )
+
+    # ---- 6. Final ranking ----
     papers = final_rank_papers(papers, analysis)
     top_k_papers = papers[:k]
 
-    # ---- 6. Build combined context ----
+    # ---- 7. Build combined context ----
     context_parts: List[str] = []
     for p in top_k_papers:
         for c in p["evidence"]:
